@@ -1,0 +1,48 @@
+{{- $secretMount := include "asi.secretMountPath" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "asi.ergo.fullname" . }}
+  labels:
+    {{- include "asi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ergo
+data:
+  render.sh: |
+    #!/bin/sh
+    # Runs as an init container, in the ergo image.
+    set -eu
+
+    # Rebuild the base config from the image on every boot so it tracks the
+    # image version. Everything this chart cares about is layered on top as
+    # ERGO__* overrides; ircd.db and the keypair live beside it on the PVC and
+    # are left alone.
+    awk '{ gsub(/path: languages/, "path: /ircd-bin/languages") }1' \
+      /ircd-bin/default.yaml > /ircd/ircd.yaml
+
+    # Self-signed keypair for the TLS listener. mkcerts refuses to overwrite
+    # and exits non-zero, so the guard is what makes restarts survivable --
+    # delete these two files to have a fresh pair issued.
+    if [ ! -f /ircd/fullchain.pem ] || [ ! -f /ircd/privkey.pem ]; then
+      /ircd-bin/ergo mkcerts
+    fi
+
+    # bcrypt the credentials here, inside the pod. ergo accepts only hashes,
+    # and doing it at startup means no hash is ever stored, shipped, or
+    # rotated separately from the plaintext it came from.
+    #
+    # The written value is single-quoted for sh (a bcrypt hash is full of '$')
+    # and double-quoted for the YAML parser that reads the override back.
+    umask 077
+    : > /render/env.sh
+    render() {
+      hash="$(printf '%s\n' "$(cat "$2")" | /ircd-bin/ergo genpasswd)"
+      printf "export %s='\"%s\"'\n" "$1" "$hash" >> /render/env.sh
+    }
+    render ERGO__SERVER__PASSWORD       {{ $secretMount }}/irc-server-password
+    render ERGO__OPERS__ADMIN__PASSWORD {{ $secretMount }}/irc-oper-password
+
+  run.sh: |
+    #!/bin/sh
+    set -eu
+    . /render/env.sh
+    exec /ircd-bin/ergo run

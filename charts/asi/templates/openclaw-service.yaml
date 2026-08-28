@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "asi.openclaw.fullname" . }}
+  labels:
+    {{- include "asi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openclaw
+spec:
+  type: {{ .Values.openclaw.service.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: openclaw
+  ports:
+    - name: gateway
+      port: {{ .Values.openclaw.gateway.port }}
+      targetPort: gateway

@@ -1,0 +1,89 @@
+nameOverride: ""
+fullnameOverride: ""
+
+secrets:
+  # Name of the Secret holding every credential. Defaults to <fullname>-secrets.
+  name: ""
+
+  # Rotation counter. Generated credentials are re-derived only when this
+  # changes; a plain `helm upgrade` reads the live values back and preserves
+  # them. `make secrets-rotate` bumps it and rolls both workloads.
+  generation: 0
+
+  # Length of each generated credential.
+  lengths:
+    ircServerPassword: 40
+    ircOperPassword: 40
+    openclawGatewayToken: 48
+
+ergo:
+  image:
+    repository: ghcr.io/ergochat/ergo
+    tag: stable
+    pullPolicy: IfNotPresent
+
+  # `network.name` and `server.name` in ircd.yaml.
+  networkName: ASI
+  serverName: irc.asi.internal
+
+  # The plaintext listener is reachable from anywhere in the cluster, which the
+  # upstream default deliberately is not -- openclaw runs in its own pod. Keep
+  # it on the pod network; expose 6697 if you need a listener off-cluster.
+  plainPort: 6667
+  tlsPort: 6697
+
+  service:
+    type: ClusterIP
+
+  persistence:
+    # Holds ircd.db (account/channel registrations) and the self-signed keypair.
+    size: 1Gi
+    storageClass: ""
+
+  resources: {}
+
+  # Extra ERGO__* config overrides, applied on top of the image's default.yaml.
+  # Values are parsed as YAML, so strings generally need no quoting.
+  extraEnv: {}
+
+openclaw:
+  image:
+    repository: ghcr.io/openclaw/openclaw
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  provider:
+    # Supplied, never generated: `make deploy` pipes this in from the
+    # environment. Rotation leaves it alone, and leaving it empty on a redeploy
+    # preserves whatever is already in the cluster rather than blanking it.
+    apiKey: ""
+    # Environment variable openclaw should read the key from.
+    envVar: OPENAI_API_KEY
+
+  irc:
+    nick: openclaw
+    username: openclaw
+    realname: ASI
+    # In-cluster hop to ergo; TLS is off because ergo's certificate is
+    # self-signed. Traffic stays on the pod network.
+    tls: false
+    channels:
+      - "#asi"
+    dmPolicy: pairing
+    groupPolicy: allowlist
+
+  gateway:
+    port: 18789
+    bind: lan
+
+  service:
+    type: ClusterIP
+
+  persistence:
+    # Holds openclaw.json, the state sqlite db, and the agent workspace.
+    size: 2Gi
+    storageClass: ""
+
+  resources: {}
+
+  extraEnv: {}

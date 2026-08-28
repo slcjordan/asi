@@ -1,0 +1,61 @@
+{{- $secretMount := include "asi.secretMountPath" . -}}
+{{- $credsMount := include "asi.credsMountPath" . -}}
+{{- $irc := .Values.openclaw.irc -}}
+{{/*
+IRC ships as an external plugin (@openclaw/irc). openclaw installs it on
+demand but will neither trust it nor run the channel unless both
+plugins.entries.irc.enabled and plugins.allow say so.
+*/}}
+{{- $config := dict
+      "gateway" (dict
+        "mode" "local"
+        "bind" .Values.openclaw.gateway.bind)
+      "plugins" (dict
+        "allow" (list "irc")
+        "entries" (dict
+          "irc" (dict "enabled" true)))
+      "channels" (dict
+        "irc" (dict
+          "enabled" true
+          "host" (include "asi.ergo.fullname" .)
+          "port" (int (ternary .Values.ergo.tlsPort .Values.ergo.plainPort $irc.tls))
+          "tls" $irc.tls
+          "nick" $irc.nick
+          "username" $irc.username
+          "realname" $irc.realname
+          "channels" $irc.channels
+          "dmPolicy" $irc.dmPolicy
+          "groupPolicy" $irc.groupPolicy
+          "passwordFile" (printf "%s/irc-server-password" $credsMount))) -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "asi.openclaw.fullname" . }}
+  labels:
+    {{- include "asi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openclaw
+data:
+  # `passwordFile` keeps the IRC PASS out of this ConfigMap and out of the
+  # pod's environment, where openclaw's own agent could read it back.
+  openclaw.json: |
+    {{- $config | toPrettyJson | nindent 4 }}
+
+  render.sh: |
+    #!/bin/sh
+    # Runs as an init container, in the openclaw image.
+    set -eu
+
+    # Both directories are subPaths of the same PVC, so they may not exist yet
+    # on a fresh volume.
+    mkdir -p /home/node/.openclaw /home/node/.config/openclaw
+
+    # The chart is the source of truth for openclaw.json: anything openclaw
+    # wrote to it in place (channels.irc.configWrites) is replaced on restart.
+    cp /config/openclaw.json /home/node/.openclaw/openclaw.json
+
+    # openclaw refuses a passwordFile that is a symlink, and every key in a
+    # Kubernetes Secret mount is one (they point into ../data). Copy the value
+    # onto a tmpfs as a regular file and point openclaw at that instead.
+    umask 077
+    cp {{ $secretMount }}/irc-server-password {{ $credsMount }}/irc-server-password
+    chmod 0600 {{ $credsMount }}/irc-server-password

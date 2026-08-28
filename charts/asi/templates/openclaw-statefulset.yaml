@@ -1,0 +1,134 @@
+{{- $name := include "asi.openclaw.fullname" . -}}
+{{- $secretMount := include "asi.secretMountPath" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "asi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openclaw
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: openclaw
+  template:
+    metadata:
+      labels:
+        {{- include "asi.labels" . | nindent 8 }}
+        app.kubernetes.io/component: openclaw
+      annotations:
+        # Rolls the pod when a rotation changes the IRC PASS or the gateway
+        # token, so it reconnects with what ergo now expects.
+        checksum/secrets: {{ include "asi.secrets.checksum" . }}
+        checksum/config: {{ include (print $.Template.BasePath "/openclaw-configmap.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        # `node` in the upstream image.
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: render
+          image: "{{ .Values.openclaw.image.repository }}:{{ .Values.openclaw.image.tag }}"
+          imagePullPolicy: {{ .Values.openclaw.image.pullPolicy }}
+          command: ["/bin/sh", "/scripts/render.sh"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: data
+              mountPath: /home/node/.openclaw
+              subPath: openclaw
+            - name: data
+              mountPath: /home/node/.config/openclaw
+              subPath: config-openclaw
+            - name: config
+              mountPath: /config
+            - name: secrets
+              mountPath: {{ $secretMount }}
+              readOnly: true
+            - name: creds
+              mountPath: {{ include "asi.credsMountPath" . }}
+      containers:
+        - name: openclaw
+          image: "{{ .Values.openclaw.image.repository }}:{{ .Values.openclaw.image.tag }}"
+          imagePullPolicy: {{ .Values.openclaw.image.pullPolicy }}
+          # Upstream entrypoint runs the gateway; nothing to override.
+          env:
+            - name: OPENCLAW_SKIP_ONBOARDING
+              value: "1"
+            - name: OPENCLAW_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "asi.secretName" . }}
+                  key: openclaw-gateway-token
+            - name: {{ .Values.openclaw.provider.envVar }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "asi.secretName" . }}
+                  key: provider-api-key
+            {{- range $key, $value := .Values.openclaw.extraEnv }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          ports:
+            - name: gateway
+              containerPort: {{ .Values.openclaw.gateway.port }}
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: gateway
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: gateway
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /home/node/.openclaw
+              subPath: openclaw
+            - name: data
+              mountPath: /home/node/.config/openclaw
+              subPath: config-openclaw
+            # Read by channels.irc.passwordFile.
+            - name: creds
+              mountPath: {{ include "asi.credsMountPath" . }}
+              readOnly: true
+          resources:
+            {{- toYaml .Values.openclaw.resources | nindent 12 }}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $name }}
+            defaultMode: 0555
+            items:
+              - key: render.sh
+                path: render.sh
+        - name: config
+          configMap:
+            name: {{ $name }}
+            items:
+              - key: openclaw.json
+                path: openclaw.json
+        - name: secrets
+          secret:
+            secretName: {{ include "asi.secretName" . }}
+            defaultMode: 0400
+        - name: creds
+          emptyDir:
+            medium: Memory
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.openclaw.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.openclaw.persistence.size | quote }}

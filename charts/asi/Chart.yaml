@@ -1,0 +1,6 @@
+apiVersion: v2
+name: asi
+description: An IRC-native assistant -- ergo (ircd) with openclaw attached as a bot.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

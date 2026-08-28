@@ -1,0 +1,126 @@
+{{- $name := include "asi.ergo.fullname" . -}}
+{{- $secretMount := include "asi.secretMountPath" . -}}
+{{- $listeners := dict
+      (printf ":%d" (int .Values.ergo.plainPort)) dict
+      (printf ":%d" (int .Values.ergo.tlsPort))
+        (dict "tls" (dict "cert" "fullchain.pem" "key" "privkey.pem") "min-tls-version" 1.2) -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "asi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ergo
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: ergo
+  template:
+    metadata:
+      labels:
+        {{- include "asi.labels" . | nindent 8 }}
+        app.kubernetes.io/component: ergo
+      annotations:
+        # Rolls the pod when a rotation changes the credentials it bcrypts.
+        checksum/secrets: {{ include "asi.secrets.checksum" . }}
+        checksum/config: {{ include (print $.Template.BasePath "/ergo-configmap.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        fsGroup: 0
+      initContainers:
+        - name: render
+          image: "{{ .Values.ergo.image.repository }}:{{ .Values.ergo.image.tag }}"
+          imagePullPolicy: {{ .Values.ergo.image.pullPolicy }}
+          command: ["/bin/sh", "/scripts/render.sh"]
+          workingDir: /ircd
+          volumeMounts:
+            - name: data
+              mountPath: /ircd
+            - name: scripts
+              mountPath: /scripts
+            - name: render
+              mountPath: /render
+            - name: secrets
+              mountPath: {{ $secretMount }}
+              readOnly: true
+      containers:
+        - name: ergo
+          image: "{{ .Values.ergo.image.repository }}:{{ .Values.ergo.image.tag }}"
+          imagePullPolicy: {{ .Values.ergo.image.pullPolicy }}
+          command: ["/bin/sh", "/scripts/run.sh"]
+          workingDir: /ircd
+          env:
+            # Config overrides layered onto the image's default.yaml, which
+            # ships with allow-environment-overrides already enabled. The
+            # password overrides are not here -- they are bcrypt hashes
+            # produced by the init container and sourced from /render/env.sh.
+            - name: ERGO__NETWORK__NAME
+              value: {{ .Values.ergo.networkName | quote }}
+            - name: ERGO__SERVER__NAME
+              value: {{ .Values.ergo.serverName | quote }}
+            # Upstream binds plaintext to loopback only; openclaw dials in
+            # from its own pod, so the listener has to be on all interfaces.
+            - name: ERGO__SERVER__LISTENERS
+              value: {{ $listeners | toJson | quote }}
+            # Upstream reads PASS as `account:password` for clients too old for
+            # SASL, which ergo refuses to combine with a server password unless
+            # SASL clients are let past it. Here PASS *is* the rotated shared
+            # secret, so the account-login reading of it has to go.
+            - name: ERGO__ACCOUNTS__LOGIN_VIA_PASS_COMMAND
+              value: "false"
+            {{- range $key, $value := .Values.ergo.extraEnv }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          ports:
+            - name: irc
+              containerPort: {{ .Values.ergo.plainPort }}
+            - name: ircs
+              containerPort: {{ .Values.ergo.tlsPort }}
+          livenessProbe:
+            tcpSocket:
+              port: irc
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            tcpSocket:
+              port: irc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /ircd
+            - name: scripts
+              mountPath: /scripts
+            - name: render
+              mountPath: /render
+              readOnly: true
+          resources:
+            {{- toYaml .Values.ergo.resources | nindent 12 }}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $name }}
+            defaultMode: 0555
+        - name: secrets
+          secret:
+            secretName: {{ include "asi.secretName" . }}
+            defaultMode: 0400
+        # The bcrypt hashes never leave the pod.
+        - name: render
+          emptyDir:
+            medium: Memory
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.ergo.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.ergo.persistence.size | quote }}
