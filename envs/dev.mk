@@ -1,4 +1,4 @@
-KUBE_CONTEXT?=k3d-asi-dev
+KUBE_CONTEXT?=k3d-halo-dev
 KUBE_NAMESPACE?=asi-dev
 
 # Supplied, not generated: `make deploy` pipes this into the chart on stdin and

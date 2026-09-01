@@ -22,6 +22,20 @@ SECRET_NAME ?= $(RELEASE)-secrets
 KUBECTL := kubectl --context $(KUBE_CONTEXT) --namespace $(KUBE_NAMESPACE)
 HELM    := helm --kube-context $(KUBE_CONTEXT) --namespace $(KUBE_NAMESPACE)
 
+# openclaw runs a locally built image -- upstream plus the @openclaw/irc
+# plugin. The chart is the source of truth for which image that is, so the
+# coordinates are read back out of values.yaml rather than written down a
+# second time here. The tag doubles as the upstream openclaw version to build
+# against, since the image is that version with a plugin added.
+DOCKERFILE       := images/openclaw/Dockerfile
+OPENCLAW_IMAGE   := $(shell awk '/^openclaw:/{o=1} o && /^    repository:/{r=$$2} o && /^    tag:/{print r ":" $$2; exit}' $(CHART)/values.yaml)
+OPENCLAW_VERSION := $(lastword $(subst :, ,$(OPENCLAW_IMAGE)))
+
+# k3d clusters have no registry here, so the image is side-loaded into the
+# nodes' containerd instead of pushed. Anything that is not a k3d context is
+# assumed to pull from a registry. Empty for those.
+K3D_CLUSTER := $(patsubst k3d-%,%,$(filter k3d-%,$(KUBE_CONTEXT)))
+
 # Rotation counter, read back from the cluster rather than tracked in a file so
 # there is no local state to drift. Deliberately recursive (`=`, not `:=`): it
 # has to reflect the cluster at recipe time, not at parse time. Absent secret
@@ -59,6 +73,29 @@ context: ## print the kube context, namespace and secret generation in use
 .PHONY: lint
 lint: ## lint the chart
 	helm lint $(CHART)
+
+.PHONY: image
+image: ## build the openclaw+irc image and make the cluster able to run it
+	@test -n "$(OPENCLAW_IMAGE)" \
+		|| { echo "could not read openclaw.image from $(CHART)/values.yaml"; exit 1; }
+	docker build \
+		--build-arg OPENCLAW_VERSION=$(OPENCLAW_VERSION) \
+		$(if $(IRC_PLUGIN_VERSION),--build-arg IRC_PLUGIN_VERSION=$(IRC_PLUGIN_VERSION),) \
+		--tag $(OPENCLAW_IMAGE) \
+		--file $(DOCKERFILE) \
+		$(dir $(DOCKERFILE))
+ifeq ($(K3D_CLUSTER),)
+	docker push $(OPENCLAW_IMAGE)
+else
+	k3d image import $(OPENCLAW_IMAGE) --cluster $(K3D_CLUSTER)
+endif
+
+.PHONY: image-show
+image-show: ## print the image the chart asks for and whether it exists locally
+	@echo "image:      $(OPENCLAW_IMAGE)"
+	@echo "dockerfile: $(DOCKERFILE)"
+	@docker image inspect $(OPENCLAW_IMAGE) --format 'built:      {{ .Created }}' 2>/dev/null \
+		|| echo "built:      not present locally -- run \`make image\`"
 
 # `lookup` returns nothing outside a live cluster, so every generated
 # credential renders as a fresh random value here. Useful for reading the
@@ -122,9 +159,15 @@ logs-openclaw: ## tail openclaw logs
 
 .PHONY: irc
 irc: ## forward the ergo TLS listener to localhost:6697
-	@echo "connect to localhost:6697 (TLS, self-signed); server password:"
-	@$(KUBECTL) get secret $(SECRET_NAME) \
-		--output jsonpath='{.data.irc-server-password}' | base64 -d; echo
+	@printf '/connect -tls localhost 6697 %s\n\n' \
+		"$$($(KUBECTL) get secret $(SECRET_NAME) \
+			--output jsonpath='{.data.irc-server-password}' | base64 -d)"
+	@echo "-tls is the part clients get wrong: no client infers TLS from the"
+	@echo "port, and ergo's 6697 listener is TLS-only, so a plaintext attempt"
+	@echo "is dropped mid-handshake -- which surfaces as an immediate"
+	@echo "disconnect with no error. The certificate is self-signed, so leave"
+	@echo "verification off (irssi: do not pass -tls_verify)."
+	@echo
 	@$(KUBECTL) port-forward service/$(RELEASE)-ergo 6697:6697
 
 .PHONY: gateway

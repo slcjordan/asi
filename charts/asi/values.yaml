@@ -48,9 +48,42 @@ ergo:
 
 openclaw:
   image:
-    repository: ghcr.io/openclaw/openclaw
-    tag: latest
+    # Built from images/openclaw/Dockerfile -- upstream openclaw with the IRC
+    # channel plugin baked in. Not upstream's image: the plugin is an external
+    # package that openclaw would otherwise have to fetch from npm at runtime.
+    #
+    # The tag is the upstream openclaw version the image is built on, and it is
+    # the one place that version is written down -- `make image` reads both
+    # fields back out of here to build and tag.
+    repository: asi/openclaw
+    tag: 2026.8.1
+    # The image is side-loaded into k3d rather than pulled from a registry, so
+    # Always would fail on a cluster that has it and no way to fetch it.
     pullPolicy: IfNotPresent
+
+  # Where the image stages openclaw's managed plugin tree, with @openclaw/irc
+  # already installed into it. The init container copies this over
+  # ~/.openclaw/npm on the volume at boot: the plugin only loads as *trusted*
+  # -- which the IRC channel requires -- from that managed root, and that root
+  # is on the PVC, so the image cannot simply ship it in place.
+  pluginStagePath: /opt/openclaw/npm
+
+  # openclaw's plugin allowlist, and it is *exclusive*: a plugin not named
+  # here does not load, however it got into the image. It has to cover much
+  # more than the channel, because the model provider and the agent harness
+  # runtime are plugins too -- and leaving those out fails at reply time
+  # rather than at startup, with "Agent harness runtime <name> is unavailable
+  # because its plugin registration is missing from this prepared run."
+  #
+  # These defaults track `provider` below: `openai` supplies the model and
+  # `codex` is the harness that runs it. Point the provider somewhere else and
+  # this list has to move with it -- `anthropic` for Claude models, and
+  # whichever harness that provider's models run under.
+  plugins:
+    allow:
+      - irc
+      - openai
+      - codex
 
   provider:
     # Supplied, never generated: `make deploy` pipes this in from the
@@ -67,10 +100,46 @@ openclaw:
     # In-cluster hop to ergo; TLS is off because ergo's certificate is
     # self-signed. Traffic stays on the pod network.
     tls: false
+    # Channels to join.
     channels:
       - "#asi"
     dmPolicy: pairing
     groupPolicy: allowlist
+
+    # The allowlist `groupPolicy: allowlist` actually consults. Joining a
+    # channel does not imply listening to it: with no entry here openclaw sits
+    # in the channel and drops every message with
+    # `drop channel <name> (not allowlisted)`.
+    #
+    # A channel is allowed by *having an entry*, so `{}` is a complete and
+    # valid one. The value is that channel's policy -- `requireMention`,
+    # `tools`, `toolsBySender`, `skills`, `enabled`, `allowFrom`,
+    # `systemPrompt`. The key `"*"` is a wildcard matching any channel.
+    #
+    # Empty means "an empty entry per channel joined above", which is the only
+    # sane default for a bot whose whole job is those channels. Set it to act
+    # on fewer channels than are joined, or to give one its own policy.
+    #
+    # This is deliberately not `groupAllowFrom`, which reads like the knob for
+    # this and is not: the plugin consults it only to narrow `groupPolicy:
+    # open`, and it gates nothing under `allowlist`.
+    groups: {}
+
+    # Merged into each entry `groups` derives from `channels`; ignored for a
+    # channel spelled out in `groups` explicitly.
+    groupDefaults:
+      # Senders admitted once the channel itself is. Both gates are separate
+      # and both drop silently-ish: an unlisted channel logs `drop channel
+      # <name> (not allowlisted)`, an unlisted sender `drop group sender
+      # <mask> (policy=allowlist)`.
+      #
+      # "*" is everyone on the network, which is defensible here rather than
+      # lax: ergo gates the network itself behind the rotated shared PASS, so
+      # "everyone" means "everyone already holding a rotated secret". Narrow
+      # it with `nick!user` or `nick!user@host` entries -- a bare nick matches
+      # only under `dangerouslyAllowNameMatching`, and ergo's cloaked hosts
+      # change per connection, so `nick!user` is the stable form.
+      allowFrom: ["*"]
 
   gateway:
     port: 18789

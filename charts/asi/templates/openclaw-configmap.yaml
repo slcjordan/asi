@@ -2,16 +2,39 @@
 {{- $credsMount := include "asi.credsMountPath" . -}}
 {{- $irc := .Values.openclaw.irc -}}
 {{/*
-IRC ships as an external plugin (@openclaw/irc). openclaw installs it on
-demand but will neither trust it nor run the channel unless both
-plugins.entries.irc.enabled and plugins.allow say so.
+`groupPolicy: allowlist` admits a channel by finding an entry for it under
+channels.irc.groups -- the entry's *presence* is the allowance, so an empty
+one is complete. Left unset, every joined channel gets an empty entry, since a
+bot that joins a channel and then ignores it is never the intent.
+*/}}
+{{- $groups := $irc.groups -}}
+{{- if not $groups -}}
+{{- $groups = dict -}}
+{{- range $irc.channels -}}
+{{- $_ := set $groups . $irc.groupDefaults -}}
+{{- end -}}
+{{- end -}}
+{{/*
+IRC ships as an external plugin (@openclaw/irc), pre-installed into the image
+by images/openclaw/Dockerfile and copied onto the volume by render.sh below.
+
+Being on disk is not enough to run it. openclaw will neither trust the plugin
+nor start the channel unless plugins.entries.irc.enabled and plugins.allow both
+say so. That allowlist is exclusive and covers everything, not just channels:
+the model provider and the agent harness are plugins as well, which is why
+openclaw.plugins.allow names them too.
+
+Deliberately no `plugins.load.paths`. Pointing openclaw at a plugin directory
+loads it with origin "config", and an untrusted plugin is refused the channel
+ingress queue -- the IRC channel would start and immediately exit, forever.
+Seeding the managed root is what makes it trusted.
 */}}
 {{- $config := dict
       "gateway" (dict
         "mode" "local"
         "bind" .Values.openclaw.gateway.bind)
       "plugins" (dict
-        "allow" (list "irc")
+        "allow" .Values.openclaw.plugins.allow
         "entries" (dict
           "irc" (dict "enabled" true)))
       "channels" (dict
@@ -26,6 +49,7 @@ plugins.entries.irc.enabled and plugins.allow say so.
           "channels" $irc.channels
           "dmPolicy" $irc.dmPolicy
           "groupPolicy" $irc.groupPolicy
+          "groups" $groups
           "passwordFile" (printf "%s/irc-server-password" $credsMount))) -}}
 apiVersion: v1
 kind: ConfigMap
@@ -52,6 +76,15 @@ data:
     # The chart is the source of truth for openclaw.json: anything openclaw
     # wrote to it in place (channels.irc.configWrites) is replaced on restart.
     cp /config/openclaw.json /home/node/.openclaw/openclaw.json
+
+    # Same rule for the plugin tree, and for the same reason: @openclaw/irc is
+    # baked into the image, but openclaw only trusts a plugin loaded from its
+    # managed root -- which is here, on the volume. Replaced wholesale rather
+    # than merged, so a version bump actually takes effect and the project
+    # directory of a superseded version does not linger beside it. Anything
+    # installed by hand into a running pod does not survive the restart.
+    rm -rf /home/node/.openclaw/npm
+    cp -a {{ .Values.openclaw.pluginStagePath }} /home/node/.openclaw/npm
 
     # openclaw refuses a passwordFile that is a symlink, and every key in a
     # Kubernetes Secret mount is one (they point into ../data). Copy the value
