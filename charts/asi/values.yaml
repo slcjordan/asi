@@ -2,8 +2,11 @@ nameOverride: ""
 fullnameOverride: ""
 
 secrets:
-  # Name of the Secret holding every credential. Defaults to <fullname>-secrets.
-  name: ""
+  # Deliberately not configurable. The Secret is always <fullname>-secrets,
+  # because the Makefile derives the same name independently
+  # (`SECRET_NAME ?= $(RELEASE)-secrets`) and every target that reads
+  # credentials -- secrets-show, oper, irc, gateway, and the rotation counter
+  # itself -- would silently read the wrong object if the two disagreed.
 
   # Rotation counter. Generated credentials are re-derived only when this
   # changes; a plain `helm upgrade` reads the live values back and preserves
@@ -97,9 +100,10 @@ openclaw:
     nick: openclaw
     username: openclaw
     realname: ASI
-    # In-cluster hop to ergo; TLS is off because ergo's certificate is
-    # self-signed. Traffic stays on the pod network.
-    tls: false
+    # No `tls` knob: the in-cluster hop to ergo is always plaintext, and the
+    # plugin could not do TLS here even if asked. See openclaw-configmap.yaml.
+    # Traffic stays on the pod network.
+
     # Channels to join.
     channels:
       - "#asi"
@@ -140,6 +144,16 @@ openclaw:
       # only under `dangerouslyAllowNameMatching`, and ergo's cloaked hosts
       # change per connection, so `nick!user` is the stable form.
       allowFrom: ["*"]
+
+      # Whether a channel message has to address the bot by nick before it
+      # gets a reply. openclaw defaults this to true for groups, which drops
+      # everything else as `drop channel <name> (missing-mention)`.
+      #
+      # False here because these channels are the bot's whole reason to exist
+      # -- it is not a guest in someone else's room, so making every line an
+      # @-mention is just friction. Set it true for a channel openclaw shares
+      # with an ongoing human conversation it should stay out of.
+      requireMention: false
 
   gateway:
     port: 18789

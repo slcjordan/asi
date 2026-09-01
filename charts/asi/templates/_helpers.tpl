@@ -23,8 +23,13 @@
 {{- printf "%s-openclaw" (include "asi.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{/*
+Not overridable on purpose -- the Makefile computes this same name on its own
+and would go looking at the wrong Secret if the chart could be pointed
+elsewhere. See values.yaml.
+*/}}
 {{- define "asi.secretName" -}}
-{{- default (printf "%s-secrets" (include "asi.fullname" .)) .Values.secrets.name -}}
+{{- printf "%s-secrets" (include "asi.fullname" .) -}}
 {{- end -}}
 
 {{- define "asi.labels" -}}

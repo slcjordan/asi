@@ -29,6 +29,38 @@ loads it with origin "config", and an untrusted plugin is refused the channel
 ingress queue -- the IRC channel would start and immediately exit, forever.
 Seeding the managed root is what makes it trusted.
 */}}
+{{/*
+The hop to ergo is always plaintext, and has no switch because it could not
+work otherwise: the plugin connects with a bare
+`tls.connect({host, port, servername})`, setting neither
+`rejectUnauthorized: false` nor a `ca`, and exposing no config key for either.
+ergo's certificate is self-signed, so the chain is refused -- and `servername`
+would be the service name, which is not among the certificate's names
+(ergo.test, localhost, 127.0.0.1, ::1), so hostname verification fails too.
+Traffic stays on the pod network. ergo.tlsPort is for humans, via `make irc`.
+*/}}
+{{- $ircConfig := dict
+      "enabled" true
+      "host" (include "asi.ergo.fullname" .)
+      "port" (int .Values.ergo.plainPort)
+      "tls" false
+      "nick" $irc.nick
+      "username" $irc.username
+      "realname" $irc.realname
+      "channels" $irc.channels
+      "dmPolicy" $irc.dmPolicy
+      "groupPolicy" $irc.groupPolicy
+      "groups" $groups
+      "passwordFile" (printf "%s/irc-server-password" $credsMount) -}}
+{{/*
+No `nickserv` block, deliberately. openclaw's nick recovery sends
+`GHOST <nick> <password>` before registration completes -- Atheme/Anope syntax
+-- while ergo's GHOST takes only `<nickname>` and requires an already
+authenticated session. Registering therefore buys no recovery, and costs the
+bot its nick outright: the plugin speaks no SASL, so it is unauthenticated at
+NICK time, and ergo's `nick-reservation: strict` refuses a reserved nick to an
+unauthenticated client. Measured, not assumed -- see the README.
+*/}}
 {{- $config := dict
       "gateway" (dict
         "mode" "local"
@@ -37,20 +69,7 @@ Seeding the managed root is what makes it trusted.
         "allow" .Values.openclaw.plugins.allow
         "entries" (dict
           "irc" (dict "enabled" true)))
-      "channels" (dict
-        "irc" (dict
-          "enabled" true
-          "host" (include "asi.ergo.fullname" .)
-          "port" (int (ternary .Values.ergo.tlsPort .Values.ergo.plainPort $irc.tls))
-          "tls" $irc.tls
-          "nick" $irc.nick
-          "username" $irc.username
-          "realname" $irc.realname
-          "channels" $irc.channels
-          "dmPolicy" $irc.dmPolicy
-          "groupPolicy" $irc.groupPolicy
-          "groups" $groups
-          "passwordFile" (printf "%s/irc-server-password" $credsMount))) -}}
+      "channels" (dict "irc" $ircConfig) -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:

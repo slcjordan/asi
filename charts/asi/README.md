@@ -122,7 +122,7 @@ one, so its init container copies the value onto a tmpfs as a regular file.
 
 ## What has to be true before the bot answers
 
-Reaching a reply in `#asi` clears four independent gates. Each one fails
+Reaching a reply in `#asi` clears five independent gates. Each one fails
 quietly — the gateway logs `ready`, the bot sits in the channel, and nothing
 looks broken — so they are worth knowing as a set. In order:
 
@@ -131,6 +131,7 @@ looks broken — so they are worth knowing as a set. In order:
 | plugin is trusted | staged into `~/.openclaw/npm` by the init container | `openChannelIngressQueue is only available for trusted plugins`, channel retries forever |
 | channel is allowlisted | `irc.groups` has an entry for it | `drop channel #asi (not allowlisted)` |
 | sender is allowlisted | that entry's `allowFrom` | `drop group sender <mask> (policy=allowlist)` |
+| message addresses the bot | that entry's `requireMention` | `drop channel #asi (missing-mention)` |
 | model and harness load | `openclaw.plugins.allow` names them | bot replies `No reply was generated for this message`; log shows `Agent harness runtime "codex" is unavailable` |
 
 The last one is the least obvious and the easiest to hit again. `plugins.allow`
@@ -148,6 +149,37 @@ Two traps in the same area, both of which look like the answer and are not:
 - **`allowFrom` does not cover channels.** The plugin sets
   `groupAllowFromFallbackToAllowFrom: false`, so the top-level `allowFrom`
   applies to DMs only. Channel senders come from the per-group `allowFrom`.
+
+## Why the nick is not registered
+
+The obvious fix for the wrong-nick problem is to register `openclaw` with
+ergo's NickServ, since the plugin has a `channels.irc.nickserv` block and its
+collision handler already sends `GHOST <nick> <password>`. **This was built,
+measured, and reverted — it makes things strictly worse.** Two reasons, both
+verified against ergo 2.19.1:
+
+1. **The GHOST never works.** `GHOST <nick> <password>` is Atheme/Anope
+   syntax. ergo's is `GHOST <nickname>`, with no password argument, and it
+   "disconnects the given user *if they're logged in with the same user
+   account*" — so it needs an already-authenticated session. The plugin sends
+   it before registration completes, unauthenticated, with an extra argument.
+   ergo has no `REGAIN` either.
+2. **Registering costs the bot its nick permanently.** The plugin speaks no
+   SASL and no CAP — it is a bare RFC1459 client that sends `NICK` while
+   unauthenticated and only identifies to NickServ after `001`. ergo's
+   `nick-reservation: strict` refuses a reserved nick to a client that is not
+   logged in. So once `openclaw` is a registered account, every connect gets
+   `433` and falls back — measured on a clean restart with nothing whatsoever
+   holding the nick, the bot came up as `openclaw_2`.
+
+`register: true` compounds it: each fallback registers a *new* junk account
+named after the fallback nick (`openclaw_`, `openclaw_2`, …), and ergo warns
+that an unregistered account name stays reserved and cannot be re-registered.
+Recovering from the experiment meant deleting `ircd.db`.
+
+Making this work needs a change outside the chart — SASL in the plugin, or
+ergo's GHOST syntax in the plugin's collision handler. Until then `make
+restart` is the fix, and the nick stays unregistered.
 
 ## Notes
 
@@ -180,9 +212,25 @@ Two traps in the same area, both of which look like the answer and are not:
   mid-handshake and shows up as an instant disconnect with no error on either
   side — ergo logs only `Client connecting` followed by `Disconnecting session
   of *`. `make irc` prints the exact line to paste.
+- **An ungraceful restart can leave openclaw connected under the wrong nick.**
+  ergo waits `idle-timeouts.disconnect` (2m30s) before reaping a session whose
+  socket died without closing; openclaw reconnects in about a second. Anything
+  landing inside that window — SIGKILL, OOM, node loss, or a host suspend that
+  freezes both ends with the socket still open — finds `openclaw` held by its
+  own corpse, falls back to `openclaw_`, and stays there. It does not rejoin
+  either, which reads as "the bot is offline": `WHOIS openclaw` gives `401 No
+  such nick` while `#asi` sits empty, and openclaw logs nothing at all. No
+  retry fires, because from the plugin's side the connection *succeeded* — the
+  reconnect monitor only watches for the socket closing. `make
+  restart-openclaw` is the fix, and is deliberately narrower than `make
+  restart`: rolling ergo would disconnect everyone on the network to repair
+  one client. A clean restart never trips this in the first place — SIGTERM
+  closes the socket and ergo reaps the session at once, which is why `make
+  deploy` is unaffected.
 - **A crash-looping pod blocks its own replacement.** A StatefulSet rolling
   update will not proceed past a pod that never becomes Ready, so a change that
-  fixes a crash loop needs the pod deleted by hand (or `make restart`).
+  fixes a crash loop needs the pod deleted by hand — or rolled with
+  `make restart-ergo` / `make restart-openclaw`, whichever is stuck.
 
 ## Beyond a dev cluster
 

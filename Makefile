@@ -143,11 +143,25 @@ status: ## show release and workload status
 	@$(HELM) status $(RELEASE) 2>/dev/null | sed -n '1,8p' || true
 	@$(KUBECTL) get statefulset,pod,pvc,svc
 
-.PHONY: restart
-restart: ## roll both workloads
-	@$(KUBECTL) rollout restart statefulset/$(RELEASE)-ergo statefulset/$(RELEASE)-openclaw
+.PHONY: restart-ergo
+restart-ergo: ## roll ergo only -- disconnects every client on the network
+	@$(KUBECTL) rollout restart statefulset/$(RELEASE)-ergo
 	@$(KUBECTL) rollout status statefulset/$(RELEASE)-ergo
+
+# The fix when openclaw is connected but answering to `openclaw_`: a rolling
+# restart is graceful, so the socket closes, ergo drops the stale session at
+# once rather than waiting out idle-timeouts.disconnect, and the new pod gets
+# the nick back. Leaves everyone else on the network connected.
+.PHONY: restart-openclaw
+restart-openclaw: ## roll openclaw only -- use this when the bot is stuck on openclaw_
+	@$(KUBECTL) rollout restart statefulset/$(RELEASE)-openclaw
 	@$(KUBECTL) rollout status statefulset/$(RELEASE)-openclaw
+
+# Ordered rather than simultaneous: openclaw restarted alongside a
+# still-restarting ergo just spends its first few seconds on ECONNREFUSED and
+# a reconnect backoff.
+.PHONY: restart
+restart: restart-ergo restart-openclaw ## roll both workloads, ergo first
 
 .PHONY: logs-ergo
 logs-ergo: ## tail ergo logs
