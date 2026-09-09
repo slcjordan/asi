@@ -1,0 +1,25 @@
+{{- include "asi.agents" . -}}
+{{- $agents := .Values.resolvedAgents -}}
+{{/*
+The agent definition files, kept out of the openclaw ConfigMap because they are
+prompt content rather than configuration and because a persona edit should roll
+the pod on its own checksum.
+
+Keys cannot contain "/", so each is `<agent id>--<filename>` and the volume's
+`items` maps it back to `<agent id>/<filename>` at mount time. render.sh reads
+the nested form.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "asi.openclaw.fullname" . }}-agents
+  labels:
+    {{- include "asi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openclaw
+data:
+  {{- range $id := $agents.ids }}
+  {{- range $path := index $agents.files $id }}
+  {{ include "asi.agents.key" (dict "path" $path) }}: |
+    {{- $.Files.Get $path | nindent 4 }}
+  {{- end }}
+  {{- end }}

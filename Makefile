@@ -141,7 +141,7 @@ oper: ## print the ergo operator login
 .PHONY: status
 status: ## show release and workload status
 	@$(HELM) status $(RELEASE) 2>/dev/null | sed -n '1,8p' || true
-	@$(KUBECTL) get statefulset,pod,pvc,svc
+	@$(KUBECTL) get statefulset,deployment,pod,pvc,svc
 
 .PHONY: restart-ergo
 restart-ergo: ## roll ergo only -- disconnects every client on the network
@@ -170,6 +170,60 @@ logs-ergo: ## tail ergo logs
 .PHONY: logs-openclaw
 logs-openclaw: ## tail openclaw logs
 	@$(KUBECTL) logs --follow statefulset/$(RELEASE)-openclaw
+
+# The collector's debug exporter writes what it receives to its own stdout, so
+# this *is* the trace view -- there is no store behind it and nothing to query.
+# Spans arrive in batches, so expect a beat between the tool call and the span.
+.PHONY: logs-otel
+logs-otel: ## tail the otel collector -- this is where exported spans show up
+	@$(KUBECTL) logs --follow deployment/$(RELEASE)-otel-collector
+
+# Trace ids, and what each trace contains. openclaw exports no run id, so the
+# trace is what ties an exec or tool span to the run that spawned it; this is
+# the grouping to reach for first.
+.PHONY: traces
+traces: ## summarize exported spans by trace id
+	@$(KUBECTL) logs deployment/$(RELEASE)-otel-collector \
+		| awk '/Trace ID +:/{t=$$NF} /^ +Name +:/{print t, $$NF}' \
+		| sort | uniq -c \
+		| awk '{printf "%-34s %-26s %s\n", $$2, $$3, $$1}' \
+		| sort
+
+# Tracks openclaw.otel.resource.workspace.store in values.yaml.
+PROVENANCE_STORE ?= /var/lib/asi/provenance/store.git
+PROVENANCE_GIT    = git --git-dir=$(PROVENANCE_STORE)
+
+.PHONY: provenance
+provenance: ## show the workspace fingerprint on current spans, and every snapshot recorded
+	@echo "attributes on spans from the running pod:"
+	@$(KUBECTL) exec statefulset/$(RELEASE)-openclaw -c openclaw -- \
+		sh -c 'tr "," "\n" < /var/run/asi/provenance/attrs | sed "s/^/  /"'
+	@echo
+	@echo "snapshots (newest first) -- pass one to \`make provenance-show SNAPSHOT=...\`:"
+	@$(KUBECTL) exec statefulset/$(RELEASE)-openclaw -c openclaw -- \
+		$(PROVENANCE_GIT) log --format='  %H  %ad  %s' --date=iso refs/heads/provenance
+
+# The point of recording a hash: turn it back into the contents. With no FILE
+# this lists the snapshot's files; with one it prints that file as it was.
+.PHONY: provenance-show
+provenance-show: ## recover a snapshot -- make provenance-show SNAPSHOT=<sha> [FILE=SOUL.md]
+	@test -n "$(SNAPSHOT)" \
+		|| { echo "set SNAPSHOT=<sha> (see \`make provenance\`)"; exit 1; }
+ifeq ($(FILE),)
+	@$(KUBECTL) exec statefulset/$(RELEASE)-openclaw -c openclaw -- \
+		$(PROVENANCE_GIT) ls-tree -r --name-only $(SNAPSHOT)
+else
+	@$(KUBECTL) exec statefulset/$(RELEASE)-openclaw -c openclaw -- \
+		$(PROVENANCE_GIT) show $(SNAPSHOT):$(FILE)
+endif
+
+# What actually changed between two workspace states.
+.PHONY: provenance-diff
+provenance-diff: ## diff two snapshots -- make provenance-diff FROM=<sha> TO=<sha>
+	@test -n "$(FROM)" -a -n "$(TO)" \
+		|| { echo "set FROM=<sha> TO=<sha> (see \`make provenance\`)"; exit 1; }
+	@$(KUBECTL) exec statefulset/$(RELEASE)-openclaw -c openclaw -- \
+		$(PROVENANCE_GIT) diff $(FROM) $(TO)
 
 .PHONY: irc
 irc: ## forward the ergo TLS listener to localhost:6697

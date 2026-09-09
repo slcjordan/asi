@@ -1,0 +1,24 @@
+{{- if .Values.otelCollector.enabled }}
+{{/*
+The name openclaw dials: `asi.otel.endpoint` builds
+http://<this service>:<otlpHttpPort> whenever openclaw.otel.endpoint is empty.
+Stays on the pod network like the ergo hop -- nothing off-cluster needs it, and
+the collector does no authentication.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "asi.collector.fullname" . }}
+  labels:
+    {{- include "asi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+spec:
+  type: {{ .Values.otelCollector.service.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: otel-collector
+  ports:
+    - name: otlp-http
+      port: {{ .Values.otelCollector.otlpHttpPort }}
+      targetPort: otlp-http
+{{- end }}

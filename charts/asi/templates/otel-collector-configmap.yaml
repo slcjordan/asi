@@ -1,0 +1,59 @@
+{{- if .Values.otelCollector.enabled }}
+{{/*
+Only the OTLP/HTTP receiver is configured. openclaw's config accepts
+`http/protobuf` and nothing else -- `grpc` is retired and rejected outright --
+so a 4317 listener would sit idle, and an open port that never takes traffic is
+worse than no port.
+
+The debug exporter is the whole sink: spans go to the collector's stdout and
+`make logs-otel` reads them. Nothing is stored. Swap this pipeline for an
+otlp/otlphttp exporter, or set openclaw.otel.endpoint and turn the collector
+off, when the traces need to outlive the pod.
+
+No span filtering, deliberately. Tool and exec spans are children of the run
+spans and carry no run id of their own, so the trace is the only thing tying a
+child to the run that spawned it -- dropping the parents to "only keep exec"
+would leave orphans with nothing to correlate against.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "asi.collector.fullname" . }}
+  labels:
+    {{- include "asi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          http:
+            endpoint: 0.0.0.0:{{ .Values.otelCollector.otlpHttpPort }}
+
+    processors:
+      batch: {}
+
+    exporters:
+      debug:
+        verbosity: {{ .Values.otelCollector.verbosity }}
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:{{ .Values.otelCollector.healthCheckPort }}
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+        logs:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+{{- end }}

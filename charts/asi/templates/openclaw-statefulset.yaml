@@ -1,5 +1,8 @@
 {{- $name := include "asi.openclaw.fullname" . -}}
 {{- $secretMount := include "asi.secretMountPath" . -}}
+{{- $provenance := and .Values.openclaw.otel.enabled .Values.openclaw.otel.resource.workspace.enabled -}}
+{{- include "asi.agents" . -}}
+{{- $agents := .Values.resolvedAgents -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -24,6 +27,11 @@ spec:
         # token, so it reconnects with what ergo now expects.
         checksum/secrets: {{ include "asi.secrets.checksum" . }}
         checksum/config: {{ include (print $.Template.BasePath "/openclaw-configmap.yaml") . | sha256sum }}
+        {{- if $agents.ids }}
+        # Rolls the pod when a persona changes, so an edit to an agent
+        # definition in git actually reaches the running agent.
+        checksum/agents: {{ include (print $.Template.BasePath "/openclaw-agents-configmap.yaml") . | sha256sum }}
+        {{- end }}
     spec:
       securityContext:
         # `node` in the upstream image.
@@ -46,16 +54,69 @@ spec:
               subPath: config-openclaw
             - name: config
               mountPath: /config
+            {{- if $agents.ids }}
+            - name: agents
+              mountPath: /agents
+            {{- end }}
             - name: secrets
               mountPath: {{ $secretMount }}
               readOnly: true
             - name: creds
               mountPath: {{ include "asi.credsMountPath" . }}
+        {{- if $provenance }}
+        # Fingerprints the workspace before openclaw can touch it, so the
+        # attributes describe what this run started from. Separate from
+        # `render` because it is a different job with a different failure
+        # mode: a fingerprint the chart could not compute must not stop the
+        # bot from starting.
+        - name: provenance
+          image: "{{ .Values.openclaw.image.repository }}:{{ .Values.openclaw.image.tag }}"
+          imagePullPolicy: {{ .Values.openclaw.image.pullPolicy }}
+          command: ["/bin/sh", "/scripts/provenance.sh"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: data
+              mountPath: /home/node/.openclaw
+              subPath: openclaw
+            - name: data
+              mountPath: {{ .Values.openclaw.otel.resource.workspace.store }}
+              subPath: provenance
+            - name: provenance
+              mountPath: {{ include "asi.provenanceMountPath" . }}
+        {{- end }}
       containers:
         - name: openclaw
           image: "{{ .Values.openclaw.image.repository }}:{{ .Values.openclaw.image.tag }}"
           imagePullPolicy: {{ .Values.openclaw.image.pullPolicy }}
+          {{- if $provenance }}
+          # Only `args` is replaced, so the image's ENTRYPOINT (`tini -s --`)
+          # still runs and tini is still pid 1 -- signal handling has to stay
+          # intact, because a SIGTERM that does not close the IRC socket
+          # cleanly is what leaves the bot stuck on `openclaw_`.
+          #
+          # This exists because the workspace fingerprint cannot be known when
+          # the pod is created: it is on the volume, and a pod's env is fixed
+          # before the volume is mounted. The init container writes it to a
+          # tmpfs and this appends it to whatever the chart set statically.
+          #
+          # The tradeoff is that upstream's CMD is now written down here as
+          # well, so an upstream change to it has to be mirrored. That is the
+          # cost of the attributes; set
+          # openclaw.otel.resource.workspace.enabled to false to drop both.
+          args:
+            - sh
+            - -c
+            - |
+              ATTRS={{ include "asi.provenanceMountPath" . }}/attrs
+              if [ -r "$ATTRS" ]; then
+                OTEL_RESOURCE_ATTRIBUTES="${OTEL_RESOURCE_ATTRIBUTES:+$OTEL_RESOURCE_ATTRIBUTES,}$(cat "$ATTRS")"
+                export OTEL_RESOURCE_ATTRIBUTES
+              fi
+              exec node openclaw.mjs gateway
+          {{- else }}
           # Upstream entrypoint runs the gateway; nothing to override.
+          {{- end }}
           env:
             - name: OPENCLAW_SKIP_ONBOARDING
               value: "1"
@@ -69,6 +130,15 @@ spec:
                 secretKeyRef:
                   name: {{ include "asi.secretName" . }}
                   key: provider-api-key
+            {{- if .Values.openclaw.otel.enabled }}
+            # Carries `agent` and `agent version` onto every exported span.
+            # Neither is available as a span attribute on the tool and exec
+            # spans that want them, but the exporter runs the standard env
+            # resource detector, so what lands here lands on all of them. See
+            # openclaw.otel.resource in values.yaml.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ include "asi.otel.resourceAttributes" . | quote }}
+            {{- end }}
             {{- range $key, $value := .Values.openclaw.extraEnv }}
             - name: {{ $key }}
               value: {{ $value | quote }}
@@ -98,6 +168,20 @@ spec:
             - name: creds
               mountPath: {{ include "asi.credsMountPath" . }}
               readOnly: true
+            {{- if $provenance }}
+            # Read by the wrapper above, not by openclaw.
+            - name: provenance
+              mountPath: {{ include "asi.provenanceMountPath" . }}
+              readOnly: true
+            # Read-only, and not for openclaw either: it is what lets
+            # `make provenance-show` resolve a snapshot hash on a span back
+            # into the contents it names. A hash nothing can dereference would
+            # identify the workspace without recovering it.
+            - name: data
+              mountPath: {{ .Values.openclaw.otel.resource.workspace.store }}
+              subPath: provenance
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.openclaw.resources | nindent 12 }}
       volumes:
@@ -108,12 +192,30 @@ spec:
             items:
               - key: render.sh
                 path: render.sh
+              {{- if $provenance }}
+              - key: provenance.sh
+                path: provenance.sh
+              {{- end }}
         - name: config
           configMap:
             name: {{ $name }}
             items:
               - key: openclaw.json
                 path: openclaw.json
+        {{- if $agents.ids }}
+        # `items` is what turns the flat `<id>--<file>` keys back into the
+        # per-agent directories render.sh copies from.
+        - name: agents
+          configMap:
+            name: {{ $name }}-agents
+            items:
+              {{- range $id := $agents.ids }}
+              {{- range $path := index $agents.files $id }}
+              - key: {{ include "asi.agents.key" (dict "path" $path) }}
+                path: {{ $id }}/{{ base $path }}
+              {{- end }}
+              {{- end }}
+        {{- end }}
         - name: secrets
           secret:
             secretName: {{ include "asi.secretName" . }}
@@ -121,6 +223,11 @@ spec:
         - name: creds
           emptyDir:
             medium: Memory
+        {{- if $provenance }}
+        - name: provenance
+          emptyDir:
+            medium: Memory
+        {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data

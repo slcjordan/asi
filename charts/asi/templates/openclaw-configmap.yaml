@@ -61,15 +61,75 @@ bot its nick outright: the plugin speaks no SASL, so it is unauthenticated at
 NICK time, and ergo's `nick-reservation: strict` refuses a reserved nick to an
 unauthenticated client. Measured, not assumed -- see the README.
 */}}
+{{- $entries := dict "irc" (dict "enabled" true) -}}
 {{- $config := dict
       "gateway" (dict
         "mode" "local"
         "bind" .Values.openclaw.gateway.bind)
       "plugins" (dict
         "allow" .Values.openclaw.plugins.allow
-        "entries" (dict
-          "irc" (dict "enabled" true)))
+        "entries" $entries)
       "channels" (dict "irc" $ircConfig) -}}
+{{/*
+Agents, from charts/asi/agents/. `ownership: "explicit"` is set only for a
+fleet: openclaw stamps it when a multi-agent config is created and says a sole
+agent needs no marker, so setting it unconditionally would opt a single agent
+out of the fallback that is currently routing every message to it.
+*/}}
+{{- include "asi.agents" . -}}
+{{- $agents := .Values.resolvedAgents -}}
+{{- if $agents.ids -}}
+{{- $agentDefaults := merge
+      (dict
+        "workspace" .Values.openclaw.agents.workspaceRoot
+        "skipBootstrap" .Values.openclaw.agents.skipBootstrap)
+      .Values.openclaw.agents.defaults -}}
+{{- $agentsConfig := dict "defaults" $agentDefaults "entries" $agents.entries -}}
+{{- if $agents.multi -}}
+{{- $_ := set $agentsConfig "ownership" "explicit" -}}
+{{- end -}}
+{{- $_ := set $config "agents" $agentsConfig -}}
+{{- if $agents.bindings -}}
+{{- $_ := set $config "bindings" $agents.bindings -}}
+{{- end -}}
+{{- end -}}
+{{/*
+OpenTelemetry export. `diagnostics.enabled` is the in-process event surface and
+`diagnostics.otel` the exporter that subscribes to it; both are required, and
+with either off the exporters never attach at all.
+
+The plugin needs the same two things the IRC channel does -- a slot in the
+exclusive `plugins.allow` and an enabled entry -- and it needs nothing else,
+because it is bundled in the image rather than installed. It is emphatically
+not staged onto the volume the way @openclaw/irc is: the gateway grants the
+internal diagnostics bus on origin "bundled", so a copy under the managed npm
+root would *lose* the access the bundled one already has.
+
+Missing it from `allow` is the failure this chart refuses to render rather than
+ship. The plugin would simply not load, `diagnostics.otel` would sit in
+openclaw.json looking correct, and no span would ever leave the pod -- the same
+shape of silent nothing as a channel that is joined but not allowlisted.
+*/}}
+{{- if .Values.openclaw.otel.enabled -}}
+{{- if not (has "diagnostics-otel" .Values.openclaw.plugins.allow) -}}
+{{- fail "openclaw.otel.enabled is true but openclaw.plugins.allow does not name \"diagnostics-otel\" -- plugins.allow is an exclusive allowlist, so the exporter would not load and nothing would be exported" -}}
+{{- end -}}
+{{- $_ := set $entries "diagnostics-otel" (dict "enabled" true) -}}
+{{- $otel := .Values.openclaw.otel -}}
+{{- $_ := set $config "diagnostics" (dict
+      "enabled" true
+      "otel" (dict
+        "enabled" true
+        "endpoint" (include "asi.otel.endpoint" .)
+        "protocol" "http/protobuf"
+        "serviceName" $otel.serviceName
+        "traces" $otel.traces
+        "metrics" $otel.metrics
+        "logs" $otel.logs
+        "sampleRate" $otel.sampleRate
+        "flushIntervalMs" (int $otel.flushIntervalMs)
+        "captureContent" $otel.captureContent)) -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -111,3 +171,119 @@ data:
     umask 077
     cp {{ $secretMount }}/irc-server-password {{ $credsMount }}/irc-server-password
     chmod 0600 {{ $credsMount }}/irc-server-password
+{{- if $agents.ids }}
+
+    # Agent definitions, from charts/asi/agents/. These are prompt content:
+    # openclaw injects the workspace's AGENTS.md / SOUL.md / IDENTITY.md /
+    # USER.md / BOOTSTRAP.md into the system prompt, and offers no way to point
+    # at context files outside the workspace, so the only way to define an
+    # agent from the repo is to land the files here.
+    #
+    # Copied file by file rather than as a directory, deliberately. The chart
+    # owns these names and replaces them on every boot -- an edit to a persona
+    # in git takes effect on the next roll, and anything openclaw or the agent
+    # wrote over one does not survive. Everything *else* in the workspace is
+    # the agent's own work and is left completely alone, which is why this is
+    # not the `rm -rf` the plugin tree gets.
+    umask 022
+{{- range $id := $agents.ids }}
+{{- $workspace := get (get $agents.entries $id) "workspace" }}
+    mkdir -p {{ $workspace }}
+{{- range $path := index $agents.files $id }}
+    cp /agents/{{ $id }}/{{ base $path }} {{ $workspace }}/{{ base $path }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.openclaw.otel.enabled .Values.openclaw.otel.resource.workspace.enabled }}
+{{- $workspace := .Values.openclaw.otel.resource.workspace }}
+
+  provenance.sh: |
+    #!/bin/sh
+    # Fingerprints the agent workspace and hands the result to the gateway as
+    # OTEL_RESOURCE_ATTRIBUTES, so every exported span says which *contents*
+    # the agent was running with. Runs as an init container, before openclaw.
+    set -eu
+
+    WORKSPACE={{ $workspace.path }}
+    STORE={{ $workspace.store }}/store.git
+    OUT={{ include "asi.provenanceMountPath" . }}/attrs
+
+    emit() {
+      printf '%s' "$1" > "$OUT"
+      echo "provenance: $1"
+    }
+
+    # A fresh volume has no workspace: openclaw generates this content on its
+    # first bootstrap rather than shipping it in the image, so on the very
+    # first boot there is genuinely nothing to fingerprint yet. Say so rather
+    # than emitting a hash of nothing.
+    if [ ! -d "$WORKSPACE" ]; then
+      emit 'openclaw.workspace.tree=absent,openclaw.workspace.snapshot=absent,openclaw.workspace.git_head=absent,openclaw.workspace.git_dirty=false'
+      exit 0
+    fi
+
+    # The workspace repo's own state, read with its environment explicitly
+    # cleared so the snapshot store below cannot leak into it. --no-optional-locks
+    # keeps a read from refreshing its index: this must not mutate the agent's
+    # repo just by looking at it.
+    # `rev-parse --verify -q` rather than plain `rev-parse`: on a repo with no
+    # commits -- which is exactly what openclaw leaves behind -- plain
+    # rev-parse prints the literal "HEAD" on stdout *and* fails, so a
+    # `|| echo none` fallback appends to it and puts a newline in the middle
+    # of the attribute. --verify -q prints nothing and just exits nonzero.
+    HEAD=$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; \
+      git --no-optional-locks -C "$WORKSPACE" rev-parse --verify -q HEAD 2>/dev/null || true)
+    [ -n "$HEAD" ] || HEAD=none
+    DIRTY=false
+    if [ -n "$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; \
+        git --no-optional-locks -C "$WORKSPACE" status --porcelain 2>/dev/null || true)" ]; then
+      DIRTY=true
+    fi
+
+    # Snapshot into a store of our own. Pointing --git-dir elsewhere while
+    # --work-tree stays on the workspace records the content without touching
+    # the workspace's .git, and a private index file keeps `git add -A` from
+    # writing the agent's.
+    mkdir -p "$(dirname "$STORE")" "$(dirname "$OUT")"
+    [ -d "$STORE" ] || git init -q --bare "$STORE"
+
+    GIT_DIR="$STORE"
+    GIT_WORK_TREE="$WORKSPACE"
+    GIT_INDEX_FILE=/tmp/provenance.index
+    export GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+    rm -f "$GIT_INDEX_FILE"
+
+    # -A is the point: every file here is untracked in the agent's own repo,
+    # so anything less would hash an empty tree.
+    git add -A
+    TREE=$(git write-tree)
+
+    # One commit per *distinct* tree. A restart that changed nothing reuses the
+    # previous snapshot id, so an unchanged workspace keeps one stable
+    # identifier across the pod's whole life rather than a commit per boot.
+    PARENT=$(git rev-parse --verify -q refs/heads/provenance || true)
+    PREV_TREE=""
+    if [ -n "$PARENT" ]; then
+      PREV_TREE=$(git rev-parse "$PARENT^{tree}")
+    fi
+
+    if [ "$TREE" = "$PREV_TREE" ]; then
+      SNAPSHOT="$PARENT"
+    else
+      GIT_AUTHOR_NAME=asi-provenance
+      GIT_AUTHOR_EMAIL=provenance@asi.invalid
+      GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+      GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+      export GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+      MESSAGE="workspace at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      if [ -n "$PARENT" ]; then
+        SNAPSHOT=$(git commit-tree "$TREE" -p "$PARENT" -m "$MESSAGE")
+      else
+        SNAPSHOT=$(git commit-tree "$TREE" -m "$MESSAGE")
+      fi
+      # The ref is what keeps these objects reachable, and so unpruned.
+      git update-ref refs/heads/provenance "$SNAPSHOT"
+    fi
+
+    emit "openclaw.workspace.tree=$TREE,openclaw.workspace.snapshot=$SNAPSHOT,openclaw.workspace.git_head=$HEAD,openclaw.workspace.git_dirty=$DIRTY"
+{{- end }}

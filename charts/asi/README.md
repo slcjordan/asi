@@ -11,6 +11,7 @@ make env-dev        # select an environment
 make image          # build the openclaw image and load it into the cluster
 make deploy         # install or upgrade
 make secrets-rotate # re-derive credentials and roll both workloads
+make traces         # exported spans, grouped by trace id
 make help           # everything else
 ```
 
@@ -71,6 +72,184 @@ On a k3d context `make image` side-loads with `k3d image import`, since there
 is no registry in the loop; on any other context it falls back to
 `docker push`, which assumes `openclaw.image.repository` names somewhere the
 cluster can actually pull from.
+
+## Agents
+
+Agents are defined in [`agents/`](agents/), one directory per agent, and
+rendered into openclaw's `agents.entries` and `bindings` at template time. The
+directory name is the agent id; a directory counts as an agent if it holds an
+`agent.yaml`. Adding one needs no change to `values.yaml`.
+
+```
+agents/main/
+  agent.yaml     # agents.entries.main, plus routing bindings
+  SOUL.md        # the definition -- injected into the system prompt
+  AGENTS.md  BOOTSTRAP.md  IDENTITY.md  USER.md
+```
+
+The `*.md` files are the agent's behaviour: openclaw injects the workspace's
+bootstrap files into the system prompt on every turn. They must be *in the
+workspace* to be injected — there is no config key for a system prompt and none
+for context files outside it — so an init container copies them in from a
+ConfigMap, and `agents.skipBootstrap` is set so openclaw does not generate
+competing copies.
+
+Those filenames are chart-owned and rewritten on every boot, which is the same
+rule `openclaw.json` and the plugin tree follow. A persona edit reaches the
+agent on the next roll, and the pod rolls by itself because the ConfigMap's
+checksum sits on the pod template. Anything the agent wrote over one of those
+files does not survive a restart; everything else in the workspace is the
+agent's own and is never touched.
+
+This also makes the workspace fingerprint in [Telemetry](#the-trace-id-is-the-run-id)
+mean something sharper — `openclaw.workspace.tree` becomes a function of what
+is committed here, so identical repo content produces an identical hash. The
+seeding runs in the `render` init container and the fingerprint in `provenance`,
+which runs after it, so the hash describes the definitions the repo just
+installed.
+
+**Adding a second agent changes the rules** — bindings become mandatory,
+workspaces move to per-agent subdirectories, and ambient services need an
+explicit owner. [`agents/README.md`](agents/README.md) covers all four traps;
+the chart refuses to render on the one that would otherwise silence the bot.
+
+## Telemetry
+
+openclaw exports OpenTelemetry through its bundled `diagnostics-otel` plugin,
+and the chart deploys a collector to receive it. On by default; the two
+surfaces worth watching are:
+
+| Span | Covers | Notable attributes |
+| ---- | ------ | ------------------ |
+| `openclaw.tool.execution` | every tool call, plugin-provided ones included | `openclaw.tool.source`, `openclaw.tool.owner`, `openclaw.toolName` |
+| `openclaw.exec` | every child process openclaw spawns | `openclaw.exec.target`, `.mode`, `.exit_code`, `.exit_signal`, `.timed_out`, `.command_length` |
+
+Both hang off `openclaw.run` / `openclaw.harness.run` (which carries
+`openclaw.harness.plugin`), alongside `openclaw.model.call` and the
+message-flow spans.
+
+```
+make logs-otel   # the collector's stdout -- this is the trace view
+make traces      # spans grouped by trace id
+```
+
+The collector is a sink, not a store: it writes what it receives to its own
+stdout with the debug exporter and retains nothing. That is deliberate for a
+dev cluster with no observability stack. Point `openclaw.otel.endpoint` at a
+real backend and set `otelCollector.enabled: false` when the traces need to
+outlive the pod.
+
+### The trace id is the run id
+
+**openclaw exports no run id on spans, by design.** Group by trace id instead.
+This is worth knowing before you go looking for the attribute: the exporter's
+`addRunAttrs()` is handed an event carrying `runId` and writes only provider,
+model, channel and trigger, and `openclaw.run_id`/`openclaw.runId` sit in a
+`DROPPED_OTEL_ATTRIBUTE_KEYS` denylist that every span passes through on its
+way out. Two independent layers, both intentional — alongside session ids,
+call ids and message ids.
+
+What you get instead is genuine parentage. Tool and exec spans are children of
+the run span and share its trace id, including children that settle *after*
+the parent run has ended (a killed child process still lands on the right
+trace).
+
+The one gap: when the exporter cannot resolve a parent span it actually
+exported, it leaves the span a root rather than naming a span no backend will
+receive — so that exec span lands on a trace by itself. It needs the run to
+have started while the exporter was running. In this chart a config change
+rolls the pod, so the next run is whole; a pod killed mid-run can still orphan
+the exec spans already in flight.
+
+This is also why `openclaw.otel.sampleRate` should stay at `1.0`. It samples
+*root* spans, and those orphans are roots — the spans you least want thinned
+are the ones a lower rate drops first. It is also why neither the chart nor the
+collector filters spans: keeping "only exec" would discard the parents that
+make an exec span meaningful.
+
+### agent, and recovering what the agent was running
+
+`openclaw.agent` never reaches tool or exec spans — it is only ever set on
+skill spans and a handful of metrics — so it is attached as a **resource**
+attribute instead, via `OTEL_RESOURCE_ATTRIBUTES`, which lands it on every span
+the process exports. `service.version` rides along as the openclaw build,
+defaulting to `openclaw.image.tag`.
+
+The openclaw build is rarely the interesting version, though. What defines this
+agent is the content of its workspace — `AGENTS.md`, `SOUL.md`, `IDENTITY.md`,
+`USER.md`, `BOOTSTRAP.md` — so three more resource attributes fingerprint that:
+
+| Attribute | What it is |
+| --------- | ---------- |
+| `openclaw.workspace.tree` | git tree hash of the directory. Pure content: identical contents hash identically on any pod, and it covers untracked and uncommitted files. |
+| `openclaw.workspace.snapshot` | commit in the provenance store, and the one that actually **recovers** the contents |
+| `openclaw.workspace.git_head` / `.git_dirty` | the workspace repo's own HEAD, and whether it has uncommitted changes |
+
+```
+make provenance                                   # fingerprint + every snapshot
+make provenance-show SNAPSHOT=<sha>               # what was in it
+make provenance-show SNAPSHOT=<sha> FILE=SOUL.md  # that file, as it was
+make provenance-diff FROM=<sha> TO=<sha>          # what changed
+```
+
+**The workspace repo has no commits and no remote.** openclaw runs `git init`
+and never commits, so every file is untracked and `git rev-parse HEAD` fails —
+`git_head` honestly reports `none`, and the tree hash carries the whole load.
+That is also why the snapshot store exists: a bare repo on the PVC, holding one
+commit per distinct workspace state on a `provenance` branch. A tree hash
+identifies contents; only the store hands them back.
+
+Snapshotting writes nothing to the workspace's own `.git`. It points
+`--git-dir` at the separate store while `--work-tree` stays on the workspace,
+with a private index, so the agent's repo gains no commits, no objects, and no
+index changes — verified, not assumed.
+
+Two things worth knowing before trusting these:
+
+- **They are computed at boot, so they describe the workspace as the pod
+  started — not as it was when a given span fired.** Per-span accuracy is not
+  available: openclaw exposes no per-run or pre-exec hook to recompute against,
+  and the exporter puts nothing workspace-shaped on a span. In practice the
+  content is generated once on first bootstrap and then persists on the PVC
+  untouched across restarts, which is what makes a boot-time value worth
+  anything; an agent that rewrites its own `SOUL.md` mid-run leaves the
+  attribute stale until the next restart. A snapshot is only added when the
+  tree actually changes, so an unchanged workspace keeps one stable id.
+- **The gateway's `args` are overridden to carry the value in.** A pod's
+  environment is fixed before its volume is mounted, so a fingerprint that only
+  exists once the PVC is there cannot be passed as a plain env var: an init
+  container writes it to a tmpfs and a two-line wrapper appends it to
+  `OTEL_RESOURCE_ATTRIBUTES` before `exec`ing the gateway. Only `args` is
+  replaced, never `command`, so the image's `tini -s --` entrypoint still runs
+  and tini is still pid 1 — signal handling has to stay intact, because a
+  SIGTERM that does not close the IRC socket cleanly is what leaves the bot
+  stuck on `openclaw_`. The cost is that upstream's `CMD`
+  (`node openclaw.mjs gateway`) is now written down here too and has to be
+  mirrored if it changes upstream. Set
+  `openclaw.otel.resource.workspace.enabled: false` to drop the wrapper and the
+  three attributes together.
+
+Resource attributes describe the *process*, not the run. That is accurate here
+because this pod runs a single agent, and is the thing to revisit if that ever
+stops being true.
+
+### The plugin is bundled, not installed
+
+`diagnostics-otel` needs a slot in `plugins.allow` and an enabled entry — the
+same two gates as the IRC channel — and nothing else. **Do not install it**,
+and do not stage it onto the volume the way `@openclaw/irc` is staged. It ships
+inside the image at `/app/extensions/diagnostics-otel`, and being bundled is
+load-bearing: the gateway hands a plugin the internal diagnostics bus only when
+its origin is `"bundled"` (or it is a trusted official install), and that bus is
+the exporter's only event source. An npm-installed copy loads, reports
+`enabled`, passes `openclaw config validate`, and exports nothing whatsoever.
+
+This is the mirror image of the IRC trap. There, the managed npm root was the
+only place a plugin could earn trust; here, moving the plugin into that root
+would *cost* it the access it already has.
+
+Leaving `diagnostics-otel` out of `plugins.allow` while `openclaw.otel.enabled`
+is true fails the render rather than deploying a pod that exports silence.
 
 ## Credentials
 
