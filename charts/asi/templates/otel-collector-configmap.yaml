@@ -50,6 +50,16 @@ data:
       # Metrics: one summary line per batch, so they cannot bury the spans.
       debug/metrics:
         verbosity: {{ .Values.otelCollector.metricsVerbosity }}
+      {{- with .Values.otelCollector.tracesEndpoint }}
+      # Retention. Spans go here *as well as* to stdout, so a quick
+      # `make traces` still works while anything older than the log window is
+      # in Jaeger. `tls.insecure` because this is a plaintext hop on the pod
+      # network between two namespaces of the same cluster.
+      otlphttp/traces:
+        endpoint: {{ . | quote }}
+        tls:
+          insecure: true
+      {{- end }}
 
     extensions:
       health_check:
@@ -61,7 +71,7 @@ data:
         traces:
           receivers: [otlp]
           processors: [batch]
-          exporters: [debug]
+          exporters: [debug{{ if .Values.otelCollector.tracesEndpoint }}, otlphttp/traces{{ end }}]
         metrics:
           receivers: [otlp]
           processors: [batch]

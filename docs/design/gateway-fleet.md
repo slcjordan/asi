@@ -690,11 +690,25 @@ otelcol_exporter_sent_spans      592
 otelcol_exporter_send_failed_spans 0
 ```
 
-Received, forwarded, printed, and scrolled away. The fix is a second debug
-exporter at `basic` for the metrics pipeline. The lesson is that a debug
-exporter is a *terminal*, not a store, and the first question about a missing
-span is always whether it was printed and lost rather than never sent — a
-question only the collector's own telemetry can answer.
+Received, forwarded, printed, and scrolled away. The immediate fix is a second
+debug exporter at `basic` for the metrics pipeline. The real fix is that spans
+now also go to a **Jaeger release in its own namespace**, so retention stops
+being a property of log rotation — separate namespace because `make nuke`
+would otherwise take the history with it, and namespace deletion ignores
+`helm.sh/resource-policy: keep`. See `deploy/jaeger.values.yaml`.
+
+The lesson cost three wrong conclusions before it landed, and it generalises:
+**a debug exporter is a terminal, not a store, and a container log is a window
+rather than a record.** Absence in either is not evidence of absence in the
+system. The first question about a missing span is whether it was printed and
+lost, not whether it was sent — and only the collector's own telemetry can
+answer that.
+
+`openclaw.tool.execution` spans were written off in an earlier draft of this
+section as non-existent, on exactly that bad reasoning. They had been
+exporting the whole time, on every gateway, and were visible in Jaeger within
+a minute of it being deployed. `openclaw.exec` spans remain genuinely
+unobserved, now including in Jaeger, and remain unexplained.
 
 ## Re-deriving the findings
 

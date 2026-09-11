@@ -33,6 +33,7 @@ GATEWAY_NAME = $(RELEASE)-$(GATEWAY)
 GATEWAY_SELECTOR := app.kubernetes.io/component=openclaw
 
 KUBECTL := kubectl --context $(KUBE_CONTEXT) --namespace $(KUBE_NAMESPACE)
+KUBECTL_JAEGER := kubectl --context $(KUBE_CONTEXT) --namespace $(JAEGER_NAMESPACE)
 HELM    := helm --kube-context $(KUBE_CONTEXT) --namespace $(KUBE_NAMESPACE)
 
 # openclaw runs a locally built image -- upstream plus the @openclaw/irc
@@ -366,6 +367,79 @@ poem: ## dispatch a poem request and watch #poetry for it -- POEM_SUBJECT=... PO
 poetry: ## tail #poetry -- POEM_WATCH=<seconds>
 	@$(KUBECTL) exec statefulset/$(RELEASE)-main -c openclaw -- \
 		node -e '$(POEM_WATCHER_JS)' "" "" "" "" "$(POEM_WATCH)"
+
+# ---------------------------------------------------------------------------
+# Jaeger
+#
+# Deliberately a separate release in a separate namespace, from the *upstream*
+# chart rather than one of ours. Separate namespace because `make nuke` deletes
+# this project's namespace and namespace deletion ignores
+# `helm.sh/resource-policy: keep` -- trace history that dies with the app is
+# barely better than the log window it replaced. Upstream chart because
+# Jaeger v2 rides the OpenTelemetry Collector and its config format is still
+# moving; that is work worth leaving to the people who make it.
+#
+# The only coupling to asi is `otelCollector.tracesEndpoint` in the chart's
+# values, which is why this can be installed, upgraded and destroyed entirely
+# on its own.
+JAEGER_RELEASE ?= jaeger
+JAEGER_CHART   ?= jaegertracing/jaeger
+JAEGER_VERSION ?= 4.13.1
+JAEGER_VALUES  ?= deploy/jaeger.values.yaml
+JAEGER_REPO    ?= https://jaegertracing.github.io/helm-charts
+
+HELM_JAEGER := helm --kube-context $(KUBE_CONTEXT) --namespace $(JAEGER_NAMESPACE)
+
+.PHONY: jaeger-repo
+jaeger-repo: ## add/refresh the upstream jaeger helm repo
+	@helm repo add jaegertracing $(JAEGER_REPO) >/dev/null
+	@helm repo update jaegertracing >/dev/null
+	@echo "jaegertracing repo ready"
+
+.PHONY: jaeger-deploy
+jaeger-deploy: jaeger-repo ## install or upgrade jaeger in its own namespace
+	@$(HELM_JAEGER) upgrade $(JAEGER_RELEASE) $(JAEGER_CHART) \
+		--install \
+		--create-namespace \
+		--version $(JAEGER_VERSION) \
+		--values $(JAEGER_VALUES)
+
+# Renders what would be applied, and then hands the resulting Jaeger config to
+# the Jaeger binary to check. The config is a full override of the image's
+# built-in one, so a typo in it is a pod that crashloops after deploy rather
+# than a template that fails to render -- this catches it beforehand.
+.PHONY: jaeger-validate
+jaeger-validate: jaeger-repo ## render jaeger and validate its config against the real binary
+	@helm template $(JAEGER_RELEASE) $(JAEGER_CHART) --namespace $(JAEGER_NAMESPACE) \
+		--version $(JAEGER_VERSION) --values $(JAEGER_VALUES) \
+		| python3 -c 'import sys,yaml; \
+		  [open("/tmp/jaeger-config.yaml","w").write(list(d["data"].values())[0]) \
+		   for d in yaml.safe_load_all(sys.stdin) if d and d["kind"]=="ConfigMap"]'
+	@docker run --rm -v /tmp/jaeger-config.yaml:/c.yaml:ro \
+		jaegertracing/jaeger:$(shell awk '/^    tag:/{gsub(/"/,"",$$2); print $$2; exit}' $(JAEGER_VALUES)) \
+		validate --config=file:/c.yaml >/dev/null 2>&1 \
+		&& echo "jaeger config valid" \
+		|| { echo "jaeger config INVALID -- run the validate by hand for the error"; exit 1; }
+
+.PHONY: jaeger-status
+jaeger-status: ## show the jaeger release and its workload
+	@$(KUBECTL_JAEGER) get deployment,pod,pvc,svc 2>&1
+
+.PHONY: logs-jaeger
+logs-jaeger: ## tail jaeger logs
+	@$(KUBECTL_JAEGER) logs --follow deployment/$(JAEGER_RELEASE)
+
+.PHONY: jaeger
+jaeger: ## forward the jaeger UI to localhost:16686
+	@echo "Jaeger UI: http://localhost:16686"
+	@echo "Traces are also still printed by the collector -- \`make traces\` for a quick look."
+	@$(KUBECTL_JAEGER) port-forward service/$(JAEGER_RELEASE) 16686:16686
+
+# Leaves the PVC behind: it carries `helm.sh/resource-policy: keep`, so the
+# traces survive an uninstall and a later reinstall picks them back up.
+.PHONY: jaeger-destroy
+jaeger-destroy: ## uninstall jaeger, keeping the trace volume
+	@$(HELM_JAEGER) uninstall $(JAEGER_RELEASE)
 
 .PHONY: destroy
 destroy: ## uninstall the release, keeping the secret and the volumes

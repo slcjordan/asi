@@ -1,0 +1,144 @@
+# Values for the upstream jaegertracing/jaeger chart -- see `make jaeger-deploy`.
+#
+# This is deliberately *not* a chart in this repo. Jaeger is deployed as its own
+# release, in its own namespace, so that `make nuke` on the asi namespace does
+# not take the trace history with it -- namespace deletion ignores
+# `helm.sh/resource-policy: keep`, and retention across time is the whole
+# reason for running Jaeger at all. The only coupling to asi is one exporter
+# endpoint in the collector's config.
+#
+# Upstream rather than hand-rolled because Jaeger v2 is built on the
+# OpenTelemetry Collector and its config format, image and ports are still
+# moving; tracking that is work worth leaving upstream. The chart itself is
+# thin here -- rendered with defaults it produces a ServiceAccount, a Service
+# and a Deployment, and nothing else -- so most of what follows is config the
+# chart has no opinion about.
+#
+# Pinned chart 4.13.1 / Jaeger 2.20.0. Everything below was verified against
+# that image before being written down: `jaeger validate` accepts the config
+# (and rejects it if a key is wrong -- checked), the container starts as uid
+# 10001 with badger on a mounted volume, a span POSTed to /v1/traces comes back
+# from /api/traces, and it is still there after a restart.
+
+# The chart's default is in-memory storage: no config volume, no args, nothing
+# persisted. `userconfig` replaces the built-in config wholesale, so this block
+# is the entire Jaeger configuration -- there is no partial override.
+userconfig:
+  service:
+    extensions: [jaeger_storage, jaeger_query, healthcheckv2]
+    pipelines:
+      traces:
+        receivers: [otlp]
+        exporters: [jaeger_storage_exporter]
+    telemetry:
+      resource:
+        service.name: jaeger
+      metrics:
+        level: detailed
+        readers:
+          - pull:
+              exporter:
+                prometheus:
+                  host: 0.0.0.0
+                  port: 8888
+
+  extensions:
+    healthcheckv2:
+      use_v2: true
+      http:
+        endpoint: 0.0.0.0:13133
+
+    jaeger_query:
+      storage:
+        traces: primary_store
+
+    # Badger: an embedded key-value store writing to the PVC below, not a
+    # separate database service. `ephemeral: false` is the load-bearing line --
+    # left true (the default) badger runs in a temp directory and the volume
+    # underneath it does nothing at all.
+    #
+    # `ttl.spans` is the retention knob, and traces do not downsample: a span is
+    # kept whole or dropped, so retention is a straight disk-for-days trade.
+    # 72h is generous for a dev cluster at a few agent turns a day.
+    jaeger_storage:
+      backends:
+        primary_store:
+          badger:
+            directories:
+              keys: /badger/key
+              values: /badger/data
+            ephemeral: false
+            ttl:
+              spans: 72h
+
+  # OTLP/HTTP only, matching the asi collector -- it exports http/protobuf, and
+  # a gRPC listener here would take no traffic.
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+
+  exporters:
+    jaeger_storage_exporter:
+      trace_storage: primary_store
+
+jaeger:
+  enabled: true
+  replicas: 1
+  image:
+    repository: jaegertracing/jaeger
+    # Pinned rather than floating: the config format above is version-specific,
+    # and an unpinned bump could invalidate it silently at the next pod roll.
+    tag: "2.20.0"
+    pullPolicy: IfNotPresent
+
+  # The chart mounts these but does not create the claim -- see extraObjects.
+  extraVolumes:
+    - name: badger-data
+      persistentVolumeClaim:
+        claimName: jaeger-badger-data
+  extraVolumeMounts:
+    - name: badger-data
+      mountPath: /badger
+
+  # Upstream's default, restated because badger writes as this user and the
+  # volume has to be group-writable for it.
+  podSecurityContext:
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+
+# The chart has no persistence support of its own for the all-in-one shape, so
+# the claim is created here. Its lifecycle is deliberately *not* the release's:
+# `helm.sh/resource-policy: keep` means `helm uninstall jaeger` leaves the
+# traces behind, the same treatment asi gives its credentials Secret.
+extraObjects:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: jaeger-badger-data
+      annotations:
+        helm.sh/resource-policy: keep
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi
+
+# Off: nothing here uses Elasticsearch or Cassandra, and the chart's storage
+# block only drives those maintenance jobs. Storage is configured in
+# `userconfig` above, which is the only place Jaeger v2 reads it from.
+spark:
+  enabled: false
+esIndexCleaner:
+  enabled: false
+esRollover:
+  enabled: false
+esLookback:
+  enabled: false

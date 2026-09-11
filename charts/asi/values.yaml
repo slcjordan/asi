@@ -589,6 +589,23 @@ otelCollector:
   # health_check, for the probes.
   healthCheckPort: 13133
 
+  # Where to forward spans for retention, in addition to printing them. Empty
+  # means print only -- the debug exporter is a terminal, not a store, so with
+  # nothing here a span lives exactly as long as the container log keeps it.
+  #
+  # Jaeger runs as its own Helm release in its own namespace (see
+  # deploy/jaeger.values.yaml and `make jaeger-deploy`), deliberately: a
+  # separate namespace is what lets trace history survive `make nuke`, which
+  # namespace deletion would otherwise take with it regardless of any
+  # resource-policy annotation. That is also why this is a plain hostname
+  # rather than something derived -- the two releases are independent, and the
+  # only thing tying them together is this string.
+  #
+  # Cross-namespace, so it needs the fully-qualified form. The collector keeps
+  # its debug exporter either way, so `make traces` still works for a quick
+  # look and Jaeger is for anything that has to outlive the log.
+  tracesEndpoint: "http://jaeger.observability.svc.cluster.local:4318"
+
   # `detailed` prints full spans with every attribute, which is the point of
   # running this at all -- it is how you see `openclaw.exec.exit_code` or
   # `openclaw.tool.owner` land. Drop to `normal` for one line per batch if the

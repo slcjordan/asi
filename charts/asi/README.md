@@ -14,6 +14,7 @@ make deploy         # install or upgrade
 make gateways       # which gateways this chart deploys
 make poem           # end-to-end test of the A2A edge (dispatch, then watch #poetry)
 make poetry         # tail #poetry
+make jaeger         # trace UI on localhost:16686
 make secrets-rotate # re-derive credentials and roll every workload
 make traces         # exported spans, grouped by trace id
 make help           # everything else
@@ -445,18 +446,49 @@ curl -s localhost:18888/metrics | grep -E "receiver_accepted|exporter_sent"
 separates "openclaw never sent it" from "the collector dropped it" from "it
 was printed and scrolled away".
 
-### Tool and exec spans do not appear
+### Retention: Jaeger
 
-`openclaw.tool.execution` and `openclaw.exec` spans — the two surfaces the
-table above names — have not been observed, on either gateway, including turns
-that demonstrably ran shell commands. The corresponding *metrics*
-(`openclaw.tool.execution.duration_ms`) do export, so openclaw is observing the
-executions; they just do not become spans.
+The collector forwards spans to a Jaeger release running in its own namespace,
+in addition to printing them. `otelCollector.tracesEndpoint` is the whole
+coupling; empty it and the collector goes back to print-only.
 
-The likely explanation is that the `codex` harness runs tools in its own
-app-server process, so openclaw's exec instrumentation never sees the child —
-but that is a hypothesis, not a verified finding. What is verified: run,
-harness, model and message spans all export correctly and share a trace id.
+```
+make jaeger-deploy    # install/upgrade it (upstream chart, own namespace)
+make jaeger           # UI on localhost:16686
+make jaeger-validate  # render + check the config against the Jaeger binary
+```
+
+Jaeger is **deliberately a separate release in a separate namespace**, from
+the upstream `jaegertracing/jaeger` chart rather than one of ours. Separate
+namespace because `make nuke` deletes this project's namespace and namespace
+deletion ignores `helm.sh/resource-policy: keep` — trace history that dies
+with the app is barely better than the log window it replaced. Upstream chart
+because Jaeger v2 rides the OpenTelemetry Collector and its config format is
+still moving.
+
+Storage is **Badger** — an embedded key-value store on a PVC, not a separate
+database — with a 72h TTL. Traces don't downsample the way metrics do (a span
+is kept whole or dropped), so retention is a straight disk-for-days trade.
+Config and reasoning are in [`deploy/jaeger.values.yaml`](../../deploy/jaeger.values.yaml).
+
+**`make jaeger-validate` is worth running before any deploy.** The values file
+supplies Jaeger's config as a *complete* override of the image's built-in one,
+so a wrong key is a crashlooping pod after deploy rather than a template that
+fails to render. The target renders the chart and hands the resulting config to
+the real Jaeger binary's `validate`, which rejects unknown keys.
+
+### Tool spans exist; the debug exporter was hiding them
+
+`openclaw.tool.execution` spans are exported, on every gateway, and show up in
+Jaeger. They were never visible in the collector's stdout, which led to a
+confident and wrong note here that they didn't exist at all.
+
+That was the same mistake as the "traces are broken" one, twice over: reading
+absence in a lossy medium as evidence of absence in the system. A debug
+exporter is a terminal, and a container log is a window — neither is a source
+of truth about what was emitted. `openclaw.exec` spans have genuinely not been
+observed even in Jaeger, which is now a real finding rather than a guess,
+though still unexplained.
 
 ### The plugin is bundled, not installed
 
