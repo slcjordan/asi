@@ -110,7 +110,6 @@ openclaw:            # unchanged: shared defaults -- image, plugins, otel, persi
 
 gateways:
   main:
-    nameSuffix: openclaw        # keeps the live StatefulSet and its PVC -- see Blast radius
     irc: { enabled: true }
     a2a:
       calls: [git-a, git-b]     # targets it may address; mints tokens both directions
@@ -125,7 +124,9 @@ gateways:
 
 **Templates.** The four `openclaw-*.yaml` files stay and become a `range` over
 `.Values.gateways`, each driven by one merged per-gateway context.
-`asi.gateway.fullname` resolves to `<fullname>-<nameSuffix|key>`.
+`asi.gateway.fullname` resolves to `<fullname>-<key>`, so `main` becomes
+`asi-main` and the live `asi-openclaw` StatefulSet is renamed -- see [Blast
+radius](#blast-radius).
 
 **Agents.** Move to `agents/<gateway>/<agentId>/agent.yaml`, glob
 `agents/*/*/agent.yaml`. Discovery stays directory-driven and the owning gateway
@@ -145,20 +146,53 @@ Four hops from the repo to the prompt, each one per gateway:
 | --- | --- |
 | ConfigMap | `asi-<gateway>-agents`, keys `<agentId>--<file>` |
 | Init container mount | `/agents/<agentId>/<file>`, via the volume's `items` |
-| Workspace after `render.sh` | `/home/node/.openclaw/workspace/`, or `.../workspace/<agentId>/` when that gateway runs more than one agent |
+| Workspace after `render.sh` | `/home/node/.openclaw/workspace/<agentId>/`, always -- see below |
 | Physically | that gateway's own PVC, `data-asi-<gateway>-0`, under subPath `openclaw/workspace` |
 
 The gateway moves out of the ConfigMap *key* and into its *name*, because there
 is now one ConfigMap per gateway.
 
-**`$multi` has to become per gateway.** It is currently computed globally --
-`gt (len $ids) 1` over every agent the glob finds (`_helpers.tpl:168`) -- and it
-decides both the workspace path (`:186`) and whether a missing `bindings` entry
-is a render error (`:197`). Left global, adding `git-a` silently moves `main`'s
-workspace from `/workspace` to `/workspace/main` and strands its existing working
-files at the old root: exactly the hazard `agents/README.md` warns about,
-triggered by a change to a *different* gateway. `git-a` with one agent must keep
-the workspace root even though the fleet now has three agents.
+**`$multi` goes away entirely.** It is currently computed globally -- `gt (len
+$ids) 1` over every agent the glob finds (`_helpers.tpl:168`) -- and three things
+branch on it: the workspace path (`:186`), whether a missing `bindings` entry is
+a render error (`:197`), and `agents.ownership: "explicit"`
+(`openclaw-configmap.yaml:88`).
+
+Left global it is actively wrong: adding `git-a` would flip `main`'s value and
+move `main`'s workspace out from under it, which is the hazard
+`agents/README.md` warns about, triggered by a change to a *different* gateway.
+Re-scoping it per gateway fixes that, but keeps three conditionals whose
+correctness depends on an agent count staying in step with a directory layout
+across a fleet. Delete the flag instead, and take the fleet branch
+unconditionally:
+
+- **Workspace is always `<root>/<agentId>`.** No agent's path depends on how
+  many others exist, so nothing moves when a gateway or an agent is added, and
+  the `entry.workspace` the chart renders agrees with the path the init
+  container seeds by construction rather than by two ternaries matching.
+- **Every agent needs `bindings`.** The fail-closed check loses its `and $multi`
+  and applies always. `agents/main/agent.yaml` carries `bindings: []` today and
+  needs a real entry -- the `#asi` example already commented in that file. Note
+  the check only tests that the list is non-empty; it cannot tell whether the
+  bindings cover every channel the gateway joins. That gap is unchanged either
+  way.
+- **`agents.ownership: "explicit"` is always set.** This is the one with
+  behavioural teeth. It opts every gateway out of openclaw's sole-agent
+  fallback, so routing is binding-driven everywhere and an uncovered surface
+  goes quiet rather than defaulting to the only agent there is. Coherent with
+  the rule above, but it is a real change to how `main` routes today, so it is
+  the thing to verify on the first deploy rather than assume.
+
+One assumption `$multi` never guarded comes along for the ride.
+`otel.resource.workspace.path` (`values.yaml:344`) is hardcoded to the
+sole-agent root, so today a second agent would leave the provenance fingerprint
+covering the *parent* of every workspace instead of the agent's own -- silently,
+with no render error. Deriving it per agent falls out of the same change.
+
+The cost is a one-time reset: `main`'s existing working files stay at
+`/workspace` while its workspace becomes `/workspace/main`. There is no
+production, and the namespace and its PVCs are expendable -- which is precisely
+what makes deleting the flag cheaper than scoping it.
 
 **ConfigMaps.** One per gateway rather than one shared, so `checksum/agents` is
 scoped: editing the git persona rolls the git pod and leaves `main` alone. That
@@ -212,9 +246,11 @@ Caller -- `main`:
 }
 ```
 
-A `bindings` entry (`{match: {channel: "a2a", accountId: "*"}}`) is only needed
-once a gateway runs more than one agent -- which is also when the chart's
-existing fail-closed check starts demanding one.
+Each gateway's agent needs a `bindings` entry covering the channels it serves --
+`{match: {channel: "a2a", accountId: "*"}}` for a git gateway. There is no
+sole-agent fallback to lean on once `ownership` is always explicit, and the
+chart's fail-closed check demands one regardless of how many agents the gateway
+runs.
 
 ## Calling convention
 
@@ -363,12 +399,16 @@ the plugin's own client is 130 lines of `fetch`.
   They become `NAME=`-parameterized.
 - **Telemetry.** `otel.serviceName` and `otel.resource.agent` are single-gateway
   assumptions -- derive both per gateway, or every span from both pods claims
-  `openclaw-gateway` / `main`. The collector stays shared.
-- **Naming.** `gateways.main.nameSuffix: openclaw` avoids renaming the live
-  StatefulSet, whose PVC holds the agent workspace, the session sqlite and the
-  provenance store. Dropping the suffix is cleaner long-term but strands that
-  volume -- recoverable through `make provenance-show`, probably not worth the
-  ceremony on dev.
+  `openclaw-gateway` / `main`. `otel.resource.workspace.path` is a single-*agent*
+  assumption in the same shape; see [Chart shape](#chart-shape). The collector
+  stays shared.
+- **Naming and volumes.** `main` renders as `asi-main`, renaming the live
+  `asi-openclaw` StatefulSet and stranding `data-asi-openclaw-0` -- the agent
+  workspace, the session sqlite and the provenance store. Accepted, for the same
+  reason the workspace move is: there is no production here, the cluster is
+  rebuildable, and anything wanted from the old volume is recoverable through
+  `make provenance-show` before it goes. A `nameSuffix` key that pinned the old
+  name would avoid the rename and is not worth carrying.
 - **Rotation.** Every pod carries `checksum/secrets` over the whole resolved map,
   so rotating any A2A token rolls the fleet. Consistent with how rotation already
   behaves.
@@ -385,12 +425,17 @@ the new gateway is never a special case.
 
 1. **Generalize the chart to a gateways map.** Range the four templates, move
    agents under `agents/<gateway>/`, split the ConfigMaps, make secret keys
-   edge-derived, and make `$multi` per gateway. Ship with only `main` defined and
-   `nameSuffix: openclaw` -- a no-op deploy that should produce a near-empty diff
-   against the live release. That diff is the test, plus one assertion it cannot
-   make on its own: `main`'s rendered workspace path must still be the bare
-   `/home/node/.openclaw/workspace`, and must stay that way after `git-a` is
-   added in step 3.
+   edge-derived, delete `$multi`, and give `main` a real `bindings` entry. Ship
+   with only `main` defined.
+
+   This is deliberately not a no-op: the StatefulSet is renamed and the
+   workspace moves, so the old release cannot be upgraded in place. Review
+   `helm template` for the intended diff, then delete the namespace and its
+   PVCs and deploy clean. The test is behavioural rather than textual -- `main`
+   still answers in `#asi`, now routed by an explicit binding with
+   `ownership: explicit` and no sole-agent fallback, and its workspace is
+   `/home/node/.openclaw/workspace/main` with the persona files in it. Adding
+   `git-a` in step 3 must not move that path.
 2. **Add the A2A channel to main.** `plugins.allow`, the enabled entry, the
    render-time guard, and the `render.sh` token substitution -- with no peers
    yet. Confirms the plugin loads and `/.well-known/agent-card.json` answers
