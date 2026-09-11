@@ -1,40 +1,69 @@
 # Gateway fleet
 
-Turning the single openclaw gateway into a fleet: a git gateway wired in over
+Turning the single openclaw gateway into a fleet: a second gateway wired in over
 A2A, a chart that makes the next one cheap, and A/B variants without a router in
 the middle.
 
 Written against openclaw `2026.8.1` and the live `asi-dev` release on
 `k3d-halo-dev`, 2026-09-08.
 
+**Status, 2026-09-11: built, deployed, and amended.** All five steps under
+[Order of work](#order-of-work) are in the chart and running on `asi-dev`. Two
+decisions in this document were overturned during that first deploy, and the
+sections below have been corrected rather than left as written:
+
+- **Calls are fire-and-forget, not blocking.** The blocking convention put
+  correlation work on `main`; see [Calling convention](#calling-convention).
+- **The poets are on IRC**, posting to `#poetry`, because an async call needs a
+  return path and `main` is no longer carrying one.
+
+Two findings from the deploy that no amount of reading would have produced are
+recorded in [What the first deploy changed](#what-the-first-deploy-changed).
+
 ## The shape of it
 
 Today the chart deploys one openclaw gateway, one ergo, one collector. This adds
-a second gateway that owns git work, reachable from the first over the bundled
-A2A channel plugin, and generalizes the chart so a third costs one values entry
-and one directory.
+a second gateway, reachable from the first over the bundled A2A channel plugin,
+and generalizes the chart so a third costs one values entry and one directory.
 
 ```
-                                                 ┌──────────────────┐
-                                            A2A  │ git-a            │
-                                        ┌───────>│ agent: git       │
-                                        │        │ :18789           │
- ┌──────────┐        ┌───────────────┐  │        └──────────────────┘
- │ ergo     │<──────>│ main          │──┤
- │ irc      │        │ agent: main   │  │        ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
- │ 6667/97  │        │ :18789        │  │  A2A     git-b
- └──────────┘        └───────────────┘  └ ─ ─ ─ >│ agent: git       │
-                             │                     variant · :18789
-                             v                   └ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
-                     ┌───────────────┐                    │
-                     │ otel-collector│<───────────────────┘
-                     │ otlp/http 4318│
-                     └───────────────┘
+ ┌──────────┐  #asi   ┌─────────────┐       A2A       ┌──────────────────┐
+ │          │<───────>│ main        │────────────────>│ poet-a           │
+ │ ergo     │         │ agent: main │ fire-and-forget │ agent: poet      │
+ │ irc      │         │ :18789      │───────────┐     └──────────────────┘
+ │ 6667/97  │         └─────────────┘           │     ┌──────────────────┐
+ │          │                                   └────>│ poet-b           │
+ │          │                                         │ agent: poet      │
+ │          │<──── #poetry ───────────────────────────│ variant · :18789 │
+ └──────────┘      (poems, posted by the poets)       └──────────────────┘
+
+        every gateway ──> otel-collector · otlp/http 4318
 ```
 
-The caller picks the variant. There is no proxy between `main` and the git
-gateways -- that is the central decision, and [A/B without a
+The caller picks the variant. There is no proxy between `main` and the second
+gateway -- that is the central decision, and [A/B without a
 router](#ab-without-a-router) is why.
+
+### Why a poet
+
+The second gateway is a deliberate placeholder. Its agent takes a subject and
+writes a poem: one model turn, one tool, no side effects, no credentials of its
+own beyond the A2A bearer and the shared IRC PASS. The deliverable here is the *fleet* -- the chart
+generalization, the A2A edge, per-gateway telemetry, caller-side variant
+selection -- and a placeholder keeps the agent from competing with that for
+attention or for debugging time. When something fails end to end it is the
+plumbing, because there is nothing else it could be.
+
+It also happens to be a good A/B subject. Two variants that differ by model or
+prompt produce visibly different poems on the same input, so [A/B without a
+router](#ab-without-a-router) can be evaluated by reading the output rather than
+by instrumenting it.
+
+What it does not exercise is long-running work, or in fact *any* of the task
+machinery: calls are fire-and-forget, so `GetTask`, the task store's limits and
+the FIFO-per-context hazard all sit unused. See [Short jobs, long
+jobs](#short-jobs-long-jobs) for what that leaves untested for whatever real
+agent takes this slot later.
 
 ## What the source actually says
 
@@ -48,7 +77,7 @@ none of them is guaranteed by the documentation.
 
 `sendA2aChannelText` hardcodes `configuration: { returnImmediately: true }` and
 returns only the task id. On the receiving side the agent's answer goes into an
-in-memory task store, never back to the caller. So `message -> a2a:git` delivers
+in-memory task store, never back to the caller. So `message -> a2a:poet` delivers
 the request and throws the answer away. Anything that needs a result calls
 `/a2a/v1` itself.
 
@@ -98,7 +127,8 @@ swapped onto each other's task ids. One context per concurrent task.
 - **Multi-gateway isolation is free here.** openclaw's warnings about profiles,
   state directories and derived ports are about several gateways on one host;
   separate pods with separate PVCs satisfy all of it by construction.
-- **`curl` and `git` are both in the image.** Verified.
+- **`curl` is in the image.** Verified -- which is all the calling convention
+  needs, since the poet agent runs no tools of its own.
 
 ## Chart shape
 
@@ -112,14 +142,18 @@ gateways:
   main:
     irc: { enabled: true }
     a2a:
-      calls: [git-a, git-b]     # targets it may address; mints tokens both directions
-  git-a:
-    irc: { enabled: false }
-    a2a: { calls: [] }
-  git-b:
-    irc: { enabled: false }
-    a2a: { calls: [] }
-    # variant: differs by model/prompt only -- same agent id, so cards and bindings match
+      calls: [poet-a, poet-b]   # targets it may address; mints tokens both directions
+  poet-a:
+    irc:                        # on IRC to *deliver*, on its own channel
+      enabled: true
+      nick: poet-a
+      channels: ["#poetry"]
+      groupDefaults: { requireMention: true }
+    messages: { visibleReplies: message_tool }
+  poet-b:
+    irc: { enabled: true, nick: poet-b, channels: ["#poetry"], groupDefaults: { requireMention: true } }
+    messages: { visibleReplies: message_tool }
+    # variant: differs by prompt only -- same agent id, so cards and bindings match
 ```
 
 **Templates.** The four `openclaw-*.yaml` files stay and become a `range` over
@@ -131,7 +165,7 @@ radius](#blast-radius).
 **Agents.** Move to `agents/<gateway>/<agentId>/agent.yaml`, glob
 `agents/*/*/agent.yaml`. Discovery stays directory-driven and the owning gateway
 becomes visible in the path. Agent ids need only be unique within a gateway, so
-both git variants keep the id `git`.
+both poet variants keep the id `poet`.
 
 ```
 charts/asi/agents/<gateway>/<agentId>/
@@ -158,7 +192,7 @@ branch on it: the workspace path (`:186`), whether a missing `bindings` entry is
 a render error (`:197`), and `agents.ownership: "explicit"`
 (`openclaw-configmap.yaml:88`).
 
-Left global it is actively wrong: adding `git-a` would flip `main`'s value and
+Left global it is actively wrong: adding `poet-a` would flip `main`'s value and
 move `main`'s workspace out from under it, which is the hazard
 `agents/README.md` warns about, triggered by a change to a *different* gateway.
 Re-scoping it per gateway fixes that, but keeps three conditionals whose
@@ -195,8 +229,10 @@ production, and the namespace and its PVCs are expendable -- which is precisely
 what makes deleting the flag cheaper than scoping it.
 
 **ConfigMaps.** One per gateway rather than one shared, so `checksum/agents` is
-scoped: editing the git persona rolls the git pod and leaves `main` alone. That
-is a straight improvement on today's single checksum.
+scoped: editing the poet persona rolls the poet pod and leaves `main` alone.
+That is a straight improvement on today's single checksum, and it is what makes
+prompt-tuning one A/B variant cheap -- editing `poet-b`'s `AGENTS.md` does not
+disturb `poet-a` or the contexts already pinned to it.
 
 **Secrets.** Keys per edge, named for what the caller *addresses*:
 `a2a-token-<target>-from-<caller>`. `asi.secrets` builds its `$lengths` dict by
@@ -219,14 +255,14 @@ credential disclosure.
 
 What the chart renders on each side of one edge.
 
-Callee -- `git-a`:
+Callee -- `poet-a`:
 
 ```json
 {
   "channels": { "a2a": {
     "enabled": true,
-    "advertisedUrl": "http://asi-git-a:18789",
-    "exposeAgents": ["git"],
+    "advertisedUrl": "http://asi-poet-a:18789",
+    "exposeAgents": ["poet"],
     "peers": { "main": { "token": "<inbound>" } }
   }},
   "plugins": { "allow": ["...", "a2a"], "entries": { "a2a": { "enabled": true } } }
@@ -237,17 +273,17 @@ Caller -- `main`:
 
 ```json
 "peers": {
-  "git-a": {
-    "token":         "<its own inbound token for git-a -> main>",
-    "url":           "http://asi-git-a:18789/a2a/v1",
-    "outboundToken": "<git-a's inbound token for main>"
+  "poet-a": {
+    "token":         "<its own inbound token for poet-a -> main>",
+    "url":           "http://asi-poet-a:18789/a2a/v1",
+    "outboundToken": "<poet-a's inbound token for main>"
   },
-  "git-b": { "...": "..." }
+  "poet-b": { "...": "..." }
 }
 ```
 
 Each gateway's agent needs a `bindings` entry covering the channels it serves --
-`{match: {channel: "a2a", accountId: "*"}}` for a git gateway. There is no
+`{match: {channel: "a2a", accountId: "*"}}` for a poet gateway. There is no
 sole-agent fallback to lean on once `ownership` is always explicit, and the
 chart's fail-closed check demands one regardless of how many agents the gateway
 runs.
@@ -255,52 +291,122 @@ runs.
 ## Calling convention
 
 The main agent makes the A2A call itself, as an HTTP client, bypassing the
-plugin's outbound path and its discarded reply. Instructions start as a paragraph
-in `agents/main/<id>/AGENTS.md` -- already copied into the workspace by the chart
+plugin's outbound path and its discarded reply. Instructions live in
+`agents/main/main/AGENTS.md` -- already copied into the workspace by the chart
 -- and graduate to a `SKILL.md` when they outgrow that.
 
+**The call is fire-and-forget.** `main` sends `returnImmediately`, gets a task
+id, discards it, and moves on. It does not wait, does not poll, and never sees
+the poem.
+
 ```sh
-curl -sS "$GIT_GATEWAY/a2a/v1" \
-  -H "Authorization: Bearer $(cat /var/run/asi/creds/a2a-git-outbound)" \
+eval "$(/var/run/asi/bin/pick-poet-gateway "$CTX")"   # sets PEER, URL, TOKEN_FILE
+
+curl -sS "$URL" \
+  -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
   -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{"message":{
-        "messageId":"'"$(uuidgen)"'","role":"ROLE_USER","contextId":"'"$CTX"'",
-        "parts":[{"text":"Rebase feature/x onto main and report conflicts."}]}}}'
+  -d '{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{
+        "configuration":{"returnImmediately":true},
+        "message":{"messageId":"'"$(cat /proc/sys/kernel/random/uuid)"'",
+        "role":"ROLE_USER","contextId":"'"$CTX"'",
+        "parts":[{"text":"for '"$NICK"': Rondeau about a rebuilt cluster."}]}}}'
 ```
 
 The token is read from a file on tmpfs, the same handling the IRC PASS gets, so
-it never enters the model's context. The reply arrives at
-`result.task.artifacts[0].parts[0].text`.
+it never enters the model's context.
+
+### Why not blocking
+
+An earlier draft of this plan had `main` block on the call and relay the answer
+into `#asi`, with `GetTask` as the fallback for long jobs. That is simpler on
+the wire and it was wrong for this fleet, for a reason that only shows up when
+you ask who holds the state:
+
+**Blocking makes `main` the correlation point.** Every request occupies its
+turn for the length of someone else's model call; concurrent requests have to
+be kept apart by hand under a FIFO-per-context reply rule that swaps answers if
+you get it wrong; and the whole conversation in `#asi` serializes behind
+whichever poem is in flight. Fire-and-forget moves all of that out of the
+top-level gateway, which is the gateway you least want holding it.
+
+### The return path is IRC, not A2A
+
+Async has one hard consequence: **the answer cannot come back on the call**, so
+something else has to deliver it. Three candidates, and only one of them
+actually removes work from `main`:
+
+| Path | Who correlates | Verdict |
+| --- | --- | --- |
+| **Poet posts to `#poetry` itself** | nobody | Chosen. |
+| Poet calls `main` back over A2A | `main` | Inbound A2A lands in a *separate isolated session*, detached from the conversation that asked, so `main` has to stitch it back -- more correlation than blocking, not less. |
+| `main` fires and polls `GetTask` | `main` | Async on the wire only. Also inherits the task store's limits. |
+
+So the poets are on IRC after all, which this plan had deferred. They are on a
+**different channel** from `main`, which is what keeps the bot-loop hazard away
+from `#asi` -- see [Blast radius](#blast-radius) for the trap itself.
+
+Two consequences worth stating, because both contradict the placeholder as
+originally scoped:
+
+- **The poet is no longer toolless.** Its source channel is A2A and its
+  destination is IRC, and openclaw has no automatic path between the two, so
+  it delivers by running `post-poem` -- a script the chart ships in its
+  ConfigMap, exactly as `main` gets `pick-poet-gateway`. Not openclaw's
+  `message(action="send")`: see [What the first deploy
+  changed](#what-the-first-deploy-changed) for why that does not survive
+  contact with the model.
+- **Nothing reports failure.** A fire-and-forget request the poet never
+  completes is indistinguishable from one still in progress. There is no
+  retry, no dead-letter, and no error path back to `main` or to the person who
+  asked. Accepted deliberately: the alternative is the correlation state this
+  design exists to avoid. It is also the first thing that stops being
+  acceptable if the slot ever takes an agent whose work matters.
+
+### Addressing
+
+`main` prefixes the request text with `for <nick>:`, naming whoever asked, and
+the poet echoes that nick when it posts. It is the only thread tying a poem in
+`#poetry` back to a person, since the request itself left no trace there.
 
 ### Short jobs, long jobs
 
-A blocking call that exceeds `replyTimeoutMs` returns the still-working task
-rather than erroring, so one code path covers both cases: the agent gets an
-answer inline when the job is quick and a task id when it isn't. Then `GetTask`
-polls by id. States run `SUBMITTED -> WORKING -> COMPLETED | FAILED | REJECTED`.
-`CancelTask` is refused with `-32004` by design, so there is no abort once a git
-job starts.
+None of it runs. Calls are fire-and-forget, so `GetTask` is never called, the
+task store is never read, and the FIFO-per-context reply hazard never fires --
+`main` discards the task id the moment it has it.
 
-Conventions this depends on:
+That is a lot of carefully-derived machinery sitting unused, and it is worth
+being explicit that it is unused rather than quietly leaving the findings above
+to imply otherwise. What remains true and would matter again the day something
+needs a result back:
 
-- **One `contextId` per concurrent task**, or replies land on the wrong task ids.
-  Sequential work on a shared context is fine.
-- **Blocking waits cap at 600s** (`replyTimeoutMs`, default 120s). Anything
-  longer must be fired with `returnImmediately`.
-- **Don't trust the task store past a pod roll.** It is memory, 24h, 500 entries.
+- **A blocking call that outruns `replyTimeoutMs`** (120s default, 600s cap)
+  returns the still-working task rather than erroring, so one code path covers
+  quick and slow.
+- **One `contextId` per concurrent task.** `completeNext` attaches a result to
+  the oldest pending task in the context, so two in flight on one context can
+  have their answers swapped.
+- **The task store does not survive a pod roll.** Memory, 24h, 500 entries.
+- **`CancelTask` is refused** with `-32004` by design.
 
-### The status log is what makes it robust
+The convention `main` actually follows now is thinner: one `contextId` per
+conversation, reused across requests so the poet keeps its memory of it, and
+one request in flight on it at a time.
 
-For anything that must outlive a pod, don't depend on the task store -- *ask the
-agent instead of the task*. The git gateway has a persistent workspace, so it
-appends progress to a file there as it works. "How's the rebase going?" becomes
-another `SendMessage` on the same `contextId`, answered from disk. That survives
-restarts, outlives 24h, and doesn't care which replica handles it. The convention
-goes in the git agent's `AGENTS.md` alongside the work instructions.
+### The status log
 
-The same log is where a context's variant assignment is recorded, which is what
-lets the selection rule under [A/B without a router](#ab-without-a-router) stop
-being a hash the caller has to keep agreeing with.
+The durability half of this is gone with the blocking call -- there is no task
+to ask about, and the poet has nothing to report progress on. Recorded here for
+whatever takes the slot later: a gateway with a persistent workspace can append
+progress to a file and answer "how's it going?" from disk, which survives
+restarts and outlives the task store.
+
+What remains, and is load-bearing, is the **variant assignment log**. The
+caller writes the chosen peer for a context into a file in `main`'s workspace,
+not the callee's -- `main` is the side that has to read it before it knows
+which gateway to address. One append-only line per context, `<contextId>
+<peer>`, and it is what lets the selection rule under [A/B without a
+router](#ab-without-a-router) stop being a hash the caller has to keep agreeing
+with.
 
 ## A/B without a router
 
@@ -325,7 +431,7 @@ method (`score = -w / ln(u)`).
 
 ```sh
 best= bestscore=
-for g in git-a git-b; do
+for g in poet-a poet-b; do
   s=$(printf '%s|%s' "$ctx" "$g" | sha256sum | cut -c1-16)
   if [ -z "$bestscore" ] || [ "$s" \> "$bestscore" ]; then best=$g bestscore=$s; fi
 done
@@ -335,17 +441,17 @@ Lexicographic comparison is safe on equal-length lowercase hex.
 
 **The hash choice matters less than recording the result.** Minimal-disruption
 properties only pay off if the mapping is recomputed, and it should not be: write
-the assignment into the same workspace status log the calling convention already
-uses, and an existing context is pinned by that record rather than by the hash.
-Adding `git-c` then cannot move it, and the hash only ever assigns contexts that
-have no record yet. Rendezvous because it is simpler and weight-extensible, not
-because its rebalancing guarantees are load-bearing.
+the assignment into `main`'s workspace status log, and an existing context is
+pinned by that record rather than by the hash. Adding `poet-c` then cannot move
+it, and the hash only ever assigns contexts that have no record yet. Rendezvous
+because it is simpler and weight-extensible, not because its rebalancing
+guarantees are load-bearing.
 
 Two practical constraints:
 
 - **It has to be a script, not prose.** An LLM asked to send 10% of work to B will
   not produce a calibrated 10%, and cannot compute a hash in its head. Ship a
-  `pick-git-gateway` script in the gateway ConfigMap and have `AGENTS.md` say
+  `pick-poet-gateway` script in the gateway ConfigMap and have `AGENTS.md` say
   *run this*. That also puts the weights in `values.yaml`, where the chart renders
   them.
 - **Weighted rendezvous needs float math**, so the shell version wants `awk`.
@@ -357,7 +463,7 @@ The natural upgrade is OpenFeature with **flagd** as the provider: k8s-native,
 flags from a ConfigMap or CRD, and its `fractional` operator does exactly this
 job -- deterministic weighted bucketing keyed by a targeting value, which would
 be the `contextId`. It buys weight changes without rolling the main pod, targeting
-rules beyond a percentage (*infra repos go to B*), and a kill switch that needs no
+rules beyond a percentage (*long-form requests go to B*), and a kill switch that needs no
 `helm upgrade`.
 
 It is not a hashing upgrade -- mod-bucketing on a murmur hash has the same
@@ -386,8 +492,8 @@ A2A does no NAT traversal; it is HTTP JSON-RPC to a URL the caller must already
 reach, and `advertisedUrl` exists only so a proxy can front it. openclaw's
 answers to an unroutable peer sit below A2A -- Tailscale Serve for a stable HTTPS
 origin, or Reef's relay for agents owned by different people, which is a
-different channel and a different trust model. If the git gateway ever leaves the
-cluster, the peer URL changes and nothing else does.
+different channel and a different trust model. If the second gateway ever leaves
+the cluster, the peer URL changes and nothing else does.
 
 There is also no A2A client library to adopt: no `@a2a-js/*` in the image, and
 the plugin's own client is 130 lines of `fetch`.
@@ -412,11 +518,13 @@ the plugin's own client is 130 lines of `fetch`.
 - **Rotation.** Every pod carries `checksum/secrets` over the whole resolved map,
   so rotating any A2A token rolls the fleet. Consistent with how rotation already
   behaves.
-- **IRC, if the git gateway ever joins.** IRC has no `allowBots`, so openclaw's
+- **IRC, if the poet gateway ever joins.** IRC has no `allowBots`, so openclaw's
   bot-loop protection cannot see a second instance as a bot. With today's
   `allowFrom: ["*"]` and `requireMention: false`, two bots in `#asi` will answer
-  each other indefinitely. Not a problem in this plan -- the git gateway is
-  A2A-only -- but it is the trap to remember if that changes.
+  each other indefinitely -- and two *poets* in a channel is the version of that
+  loop that produces the most output before anyone notices. Not a problem in this
+  plan, since the poet gateway is A2A-only, but it is the trap to remember if
+  that changes.
 
 ## Order of work
 
@@ -435,22 +543,29 @@ the new gateway is never a special case.
    still answers in `#asi`, now routed by an explicit binding with
    `ownership: explicit` and no sole-agent fallback, and its workspace is
    `/home/node/.openclaw/workspace/main` with the persona files in it. Adding
-   `git-a` in step 3 must not move that path.
+   `poet-a` in step 3 must not move that path.
 2. **Add the A2A channel to main.** `plugins.allow`, the enabled entry, the
    render-time guard, and the `render.sh` token substitution -- with no peers
    yet. Confirms the plugin loads and `/.well-known/agent-card.json` answers
    before any second pod exists.
-3. **Stand up git-a.** New values entry, `agents/git-a/git/` with the persona and
-   the status-log convention, IRC off, one edge from `main`. Verify end to end
-   with a blocking `SendMessage` from inside the main pod before any agent is
-   taught about it.
+3. **Stand up poet-a.** New values entry, `agents/poet-a/poet/` with the persona,
+   IRC off, one edge from `main`. The persona is short by design: take a subject
+   (and optionally a form), return a poem, no tools. Verify end to end with a
+   blocking `SendMessage` from inside the main pod before any agent is taught
+   about it -- a poem in `result.task.artifacts[0].parts[0].text` is the whole
+   pass condition, and it is unambiguous in a way a git result would not be.
 4. **Teach the main agent to call it.** The curl paragraph in `AGENTS.md`, the
    tmpfs token mount, per-task contexts, and the `GetTask` follow-up. This is the
-   step where the git gateway becomes reachable by conversation rather than by
-   hand.
-5. **Add git-b and the selection rule.** Copy the gateway entry, vary the model or
-   prompt, keep the agent id. The split rule goes in the skill. Only worth doing
-   once there is a real variant to compare.
+   step where the poet gateway becomes reachable by conversation rather than by
+   hand. Write the polling branch here even though step 3 proved the inline one;
+   see [Short jobs, long jobs](#short-jobs-long-jobs) for how to force it to run
+   at least once.
+5. **Add poet-b and the selection rule.** Copy the gateway entry, vary the model
+   or prompt -- a different model, or the same model told to favour a different
+   register -- and keep the agent id. The split rule and the assignment log go in
+   the skill. Unlike a git variant, this one is worth doing immediately: it is the
+   cheapest honest test of caller-side selection, and comparing two variants is
+   the one thing the placeholder is genuinely good at.
 
 ## Deliberately not doing
 
@@ -464,8 +579,122 @@ the new gateway is never a special case.
 - **No custom plugin or MCP wrapper** for the outbound call. `exec` plus `curl`
   covers it; a plugin only earns its keep if the call needs to be unavailable to
   the agent's own shell.
-- **No git gateway on IRC** in this pass. It is a good complement for long jobs,
-  but it needs the channel-policy rework above first.
+- ~~**No poet gateway on IRC** in this pass.~~ **Overturned.** Fire-and-forget
+  needs a return path and IRC is the only one that keeps correlation out of
+  `main`. The channel-policy rework came with it: separate channel, and
+  `requireMention: true` so the two poets in `#poetry` do not answer each
+  other.
+- **No tools beyond a shell and `post-poem` in the poet agent.** Delivery
+  forced that much on it; nothing else should follow. Every further capability is one to
+  re-litigate when the placeholder is replaced, and a second thing to suspect
+  when the plumbing misbehaves. No memory, no retrieval, no filesystem work.
+- **No promoting the placeholder.** When there is real work for a second gateway
+  -- git or otherwise -- it takes the slot as a new gateway key with its own
+  agent directory, and the poet stays or goes on its own merits. Growing tools
+  onto `poet` to avoid writing a values entry would defeat the point of making
+  the entry cheap.
+
+## What the first deploy changed
+
+Two things that reading the source would not have produced, both found by
+running it.
+
+### `messages.visibleReplies` has no safe default
+
+Unset, openclaw resolves the delivery contract from the agent harness's
+`deliveryDefaults.sourceVisibleReplies`, and only an internal WebChat surface
+is guaranteed `automatic`. On A2A it resolved to `message_tool`: the agent's
+final text is withheld unless it calls the message tool. A toolless poet then
+wrote a correct poem, completed its run, and delivered nothing:
+
+```
+[source-reply/private-final] agent produced a long private final reply without
+  calling the configured delivery tool (message_tool_only); response kept
+  private and not delivered to the source channel
+[turn/execution] visible channel turn dispatched with no queued reply payloads:
+  channel=a2a ... cause=completed
+```
+
+Nothing errored. The run *completed*. The caller's blocking call returned on
+time with an empty artifact list, and the only trace was those two lines in the
+callee's log. The chart now writes the key explicitly for every gateway --
+`automatic` for `main`, `message_tool` for the poets -- because a value that
+varies by harness and by surface is precisely the silent-nothing failure this
+chart refuses everywhere else.
+
+### Delivery is a shell command, not openclaw's reply path
+
+Cross-channel delivery -- answering into a channel that is not the turn's
+source channel -- goes through `message(action="send")`, and the model would
+not call it. The poem was written, the turn completed successfully, and the
+text was discarded, three times running:
+
+```
+[turn/execution] visible channel turn dispatched with no queued reply payloads:
+  channel=a2a sessionKey=agent:poet:a2a:...:irc-channel-asi cause=completed
+```
+
+This is a documented weakness rather than a misconfiguration. openclaw's own
+docs: *"Some weaker models can answer final text but fail to understand that
+source-visible output must be sent with `message(action=send)`… For models
+that repeatedly strand replies, use `automatic`."* But `automatic` delivers to
+the **source** channel, which here is A2A -- so the one reliable path could not
+reach `#poetry`, and the one path that could reach `#poetry` was the unreliable
+one. `openclaw doctor` reported no mismatch; the tool was available and simply
+unused.
+
+Three escalating prompt revisions did not move it, including an unmissable
+instruction at the top of the file. What fixed it, first try, was giving the
+poet a **`post-poem` script** and telling it to run that instead.
+
+The lesson generalises past this fleet: **a delivery tool competes with the
+model's belief that its final text is its answer; an ordinary action tool does
+not.** Running a command is a thing models do without being reminded. Framing
+the same work as "reply, but through this tool" is the framing they drop.
+
+Three things fell out of the change beyond reliability:
+
+- **The nick is right.** openclaw opens a fresh IRC connection per
+  cross-channel send, which collided with its own persistent connection and
+  posted as `poet-a_`. Verified across three configurations -- not joined,
+  joined and listening, joined and not listening -- so it was openclaw
+  behaviour, not a chart setting. With no openclaw IRC channel on the poets at
+  all, nothing holds the nick and `post-poem` takes `poet-a` cleanly.
+- **The bot loop is structural, not policed.** The poets are never *in*
+  `#poetry` between posts, so there is no inbound traffic for them to answer
+  and no `requireMention` rule to get right.
+- **`visibleReplies` stops mattering on the poets.** Their final text goes
+  nowhere either way; the script is the delivery.
+
+Still one IRC connection per poem, against ergo's per-IP connection throttle.
+Fine at conversational rates, unmeasured above them -- but now it is our code,
+so it is fixable without waiting on upstream.
+
+### Traces were never broken; metrics were drowning them
+
+The collector's stdout is the whole trace store, and a container log is a
+fixed-size window. Metrics export every `flushIntervalMs` regardless of
+activity; spans only when an agent runs. At `detailed` a metrics batch is
+~3,000 lines, so the retained window collapsed to about three minutes and
+`make traces` reliably found nothing.
+
+Two wrong conclusions were reached before the right one, both from reading
+absence as evidence: first "traces are not exported" (they were), then "24
+trace batches arrived" (those were metric *data points* carrying a
+`signal=traces` attribute). What settled it was the collector's own counters,
+which are not in the log at all:
+
+```
+otelcol_receiver_accepted_spans  592
+otelcol_exporter_sent_spans      592
+otelcol_exporter_send_failed_spans 0
+```
+
+Received, forwarded, printed, and scrolled away. The fix is a second debug
+exporter at `basic` for the metrics pipeline. The lesson is that a debug
+exporter is a *terminal*, not a store, and the first question about a missing
+span is always whether it was printed and lost rather than never sent — a
+question only the collector's own telemetry can answer.
 
 ## Re-deriving the findings
 

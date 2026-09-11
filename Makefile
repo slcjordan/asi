@@ -19,6 +19,19 @@ CHART       := charts/asi
 RELEASE     ?= asi
 SECRET_NAME ?= $(RELEASE)-secrets
 
+# Which gateway the per-gateway targets act on. The chart deploys a fleet --
+# one StatefulSet, Service, ConfigMap pair and PVC per entry under `gateways`
+# in values.yaml -- and every workload is named `$(RELEASE)-<gateway>`. `main`
+# is the IRC-facing one and the only one a human normally wants, so it is the
+# default; `make gateways` lists the rest.
+GATEWAY ?= main
+GATEWAY_NAME = $(RELEASE)-$(GATEWAY)
+
+# Selects every gateway pod at once, for the targets that should not have to
+# name them. Reading the label beats parsing values.yaml, and beats keeping a
+# second list here that could fall out of step with the chart.
+GATEWAY_SELECTOR := app.kubernetes.io/component=openclaw
+
 KUBECTL := kubectl --context $(KUBE_CONTEXT) --namespace $(KUBE_NAMESPACE)
 HELM    := helm --kube-context $(KUBE_CONTEXT) --namespace $(KUBE_NAMESPACE)
 
@@ -68,7 +81,17 @@ context: ## print the kube context, namespace and secret generation in use
 	@echo "context:    $(KUBE_CONTEXT)"
 	@echo "namespace:  $(KUBE_NAMESPACE)"
 	@echo "release:    $(RELEASE)"
+	@echo "gateway:    $(GATEWAY)  (override with GATEWAY=<name>)"
 	@echo "generation: $(CURRENT_GENERATION)"
+
+# Rendered rather than read from the cluster, so it answers before the first
+# deploy and answers with what the chart *would* create rather than with
+# whatever happens to be running.
+.PHONY: gateways
+gateways: ## list the gateways the chart deploys
+	@helm template $(RELEASE) $(CHART) --namespace $(KUBE_NAMESPACE) \
+		| awk '/^kind: StatefulSet/{k=1} k && /asi\.dev\/gateway:/{print $$2; k=0}' \
+		| sort -u
 
 .PHONY: lint
 lint: ## lint the chart
@@ -123,8 +146,11 @@ deploy: ## install or upgrade the release (idempotent; preserves existing secret
 		--create-namespace \
 		--values -
 
+# Every pod carries `checksum/secrets` over the whole resolved map, so this
+# rolls the entire fleet -- ergo and every gateway -- however few credentials
+# actually changed.
 .PHONY: secrets-rotate
-secrets-rotate: ## re-derive every generated credential and roll both workloads
+secrets-rotate: ## re-derive every generated credential and roll every workload
 	@echo "rotating $(SECRET_NAME): generation $(CURRENT_GENERATION) -> $$(( $(CURRENT_GENERATION) + 1 ))"
 	@$(MAKE) --no-print-directory deploy GENERATION=$$(( $(CURRENT_GENERATION) + 1 ))
 
@@ -152,24 +178,30 @@ restart-ergo: ## roll ergo only -- disconnects every client on the network
 # restart is graceful, so the socket closes, ergo drops the stale session at
 # once rather than waiting out idle-timeouts.disconnect, and the new pod gets
 # the nick back. Leaves everyone else on the network connected.
-.PHONY: restart-openclaw
-restart-openclaw: ## roll openclaw only -- use this when the bot is stuck on openclaw_
-	@$(KUBECTL) rollout restart statefulset/$(RELEASE)-openclaw
-	@$(KUBECTL) rollout status statefulset/$(RELEASE)-openclaw
+.PHONY: restart-gateway
+restart-gateway: ## roll one gateway -- GATEWAY=<name>; use this when the bot is stuck on openclaw_
+	@$(KUBECTL) rollout restart statefulset/$(GATEWAY_NAME)
+	@$(KUBECTL) rollout status statefulset/$(GATEWAY_NAME)
 
-# Ordered rather than simultaneous: openclaw restarted alongside a
+.PHONY: restart-gateways
+restart-gateways: ## roll every gateway in the fleet
+	@$(KUBECTL) rollout restart statefulset --selector $(GATEWAY_SELECTOR)
+	@$(KUBECTL) rollout status statefulset/$(RELEASE)-main
+
+# Ordered rather than simultaneous: a gateway restarted alongside a
 # still-restarting ergo just spends its first few seconds on ECONNREFUSED and
-# a reconnect backoff.
+# a reconnect backoff. Only `main` talks to ergo, but the A2A peers are worth
+# rolling together so the fleet comes back from one known state.
 .PHONY: restart
-restart: restart-ergo restart-openclaw ## roll both workloads, ergo first
+restart: restart-ergo restart-gateways ## roll every workload, ergo first
 
 .PHONY: logs-ergo
 logs-ergo: ## tail ergo logs
 	@$(KUBECTL) logs --follow statefulset/$(RELEASE)-ergo
 
-.PHONY: logs-openclaw
-logs-openclaw: ## tail openclaw logs
-	@$(KUBECTL) logs --follow statefulset/$(RELEASE)-openclaw
+.PHONY: logs-gateway
+logs-gateway: ## tail one gateway's logs -- GATEWAY=<name>
+	@$(KUBECTL) logs --follow statefulset/$(GATEWAY_NAME)
 
 # The collector's debug exporter writes what it receives to its own stdout, so
 # this *is* the trace view -- there is no store behind it and nothing to query.
@@ -194,13 +226,13 @@ PROVENANCE_STORE ?= /var/lib/asi/provenance/store.git
 PROVENANCE_GIT    = git --git-dir=$(PROVENANCE_STORE)
 
 .PHONY: provenance
-provenance: ## show the workspace fingerprint on current spans, and every snapshot recorded
-	@echo "attributes on spans from the running pod:"
-	@$(KUBECTL) exec statefulset/$(RELEASE)-openclaw -c openclaw -- \
+provenance: ## show one gateway's workspace fingerprint and snapshots -- GATEWAY=<name>
+	@echo "attributes on spans from $(GATEWAY_NAME):"
+	@$(KUBECTL) exec statefulset/$(GATEWAY_NAME) -c openclaw -- \
 		sh -c 'tr "," "\n" < /var/run/asi/provenance/attrs | sed "s/^/  /"'
 	@echo
 	@echo "snapshots (newest first) -- pass one to \`make provenance-show SNAPSHOT=...\`:"
-	@$(KUBECTL) exec statefulset/$(RELEASE)-openclaw -c openclaw -- \
+	@$(KUBECTL) exec statefulset/$(GATEWAY_NAME) -c openclaw -- \
 		$(PROVENANCE_GIT) log --format='  %H  %ad  %s' --date=iso refs/heads/provenance
 
 # The point of recording a hash: turn it back into the contents. With no FILE
@@ -210,10 +242,10 @@ provenance-show: ## recover a snapshot -- make provenance-show SNAPSHOT=<sha> [F
 	@test -n "$(SNAPSHOT)" \
 		|| { echo "set SNAPSHOT=<sha> (see \`make provenance\`)"; exit 1; }
 ifeq ($(FILE),)
-	@$(KUBECTL) exec statefulset/$(RELEASE)-openclaw -c openclaw -- \
+	@$(KUBECTL) exec statefulset/$(GATEWAY_NAME) -c openclaw -- \
 		$(PROVENANCE_GIT) ls-tree -r --name-only $(SNAPSHOT)
 else
-	@$(KUBECTL) exec statefulset/$(RELEASE)-openclaw -c openclaw -- \
+	@$(KUBECTL) exec statefulset/$(GATEWAY_NAME) -c openclaw -- \
 		$(PROVENANCE_GIT) show $(SNAPSHOT):$(FILE)
 endif
 
@@ -222,7 +254,7 @@ endif
 provenance-diff: ## diff two snapshots -- make provenance-diff FROM=<sha> TO=<sha>
 	@test -n "$(FROM)" -a -n "$(TO)" \
 		|| { echo "set FROM=<sha> TO=<sha> (see \`make provenance\`)"; exit 1; }
-	@$(KUBECTL) exec statefulset/$(RELEASE)-openclaw -c openclaw -- \
+	@$(KUBECTL) exec statefulset/$(GATEWAY_NAME) -c openclaw -- \
 		$(PROVENANCE_GIT) diff $(FROM) $(TO)
 
 .PHONY: irc
@@ -238,12 +270,102 @@ irc: ## forward the ergo TLS listener to localhost:6697
 	@echo
 	@$(KUBECTL) port-forward service/$(RELEASE)-ergo 6697:6697
 
+# One token per gateway, so this is a credential for $(GATEWAY) and nothing
+# else. The A2A routes register with `auth: "plugin"` and are gated by the
+# per-peer bearers instead, so this token has no part in traffic between
+# gateways.
 .PHONY: gateway
-gateway: ## forward the openclaw control UI to localhost:18789
-	@echo "gateway token:"
+gateway: ## forward one gateway's control UI to localhost:18789 -- GATEWAY=<name>
+	@echo "gateway token ($(GATEWAY)):"
 	@$(KUBECTL) get secret $(SECRET_NAME) \
-		--output jsonpath='{.data.openclaw-gateway-token}' | base64 -d; echo
-	@$(KUBECTL) port-forward service/$(RELEASE)-openclaw 18789:18789
+		--output jsonpath='{.data.openclaw-gateway-token-$(GATEWAY)}' | base64 -d; echo
+	@$(KUBECTL) port-forward service/$(GATEWAY_NAME) 18789:18789
+
+# The end-to-end test for the A2A edge, run from inside `main` exactly the way
+# the agent runs it: pick a variant, read the bearer off tmpfs, dispatch one
+# fire-and-forget SendMessage. Nothing comes back on that call by design, so
+# this joins #poetry *before* dispatching and then watches for the poem, which
+# is the only place it ever appears.
+#
+# A poem in the watch window means the whole path works: channel loaded, peer
+# authenticated, binding matched, agent answered, and the agent's own
+# message(action="send") reached IRC. Silence means one of those failed, and
+# `make logs-gateway GATEWAY=poet-a` is the next stop. Exits non-zero on
+# silence, so it is usable as a check and not just as a demo.
+#
+# All of it in node rather than curl plus shell: the image has node, a request
+# body should not be assembled by pasting strings into JSON, and the watcher
+# needs a socket anyway. The bearer goes in through the environment, not argv.
+# Deliberately no single quotes anywhere in the script below -- it is embedded
+# in single quotes to keep it clear of both make and shell expansion.
+POEM_SUBJECT ?= A villanelle about a k3d cluster being rebuilt.
+POEM_CTX     ?= make-poem
+POEM_FOR     ?= $(USER)
+POEM_WATCH   ?= 120
+
+define POEM_WATCHER_JS
+const [url, ctx, subject, who, watch] = process.argv.slice(-5);
+const net = require("net"), fs = require("fs"), crypto = require("crypto");
+const pass = fs.readFileSync("/var/run/asi/creds/irc-server-password", "utf8").trim();
+const nick = "poem-watch";
+let buf = "", started = false;
+const s = net.connect(6667, "asi-ergo", () =>
+  s.write("PASS " + pass + "\r\nNICK " + nick + "\r\nUSER " + nick + " 0 * :" + nick + "\r\n"));
+s.on("data", (d) => {
+  buf += d;
+  const lines = buf.split("\r\n"); buf = lines.pop();
+  for (const l of lines) {
+    if (l.startsWith("PING")) { s.write("PONG" + l.slice(4) + "\r\n"); continue; }
+    const p = l.split(" ");
+    if (p[1] === "001") s.write("JOIN #poetry\r\n");
+    if (p[1] === "JOIN" && l.indexOf(nick + "!") === 1 && !started) { started = true; begin(); }
+    if (p[1] === "PRIVMSG" && p[2] === "#poetry") {
+      console.log("<" + l.slice(1, l.indexOf("!")) + "> " + l.slice(l.indexOf(" :", 1) + 2));
+      if (url) process.exit(0);
+    }
+  }
+});
+async function begin() {
+  if (!url) { console.error("watching #poetry for " + watch + "s"); return; }
+  const body = { jsonrpc: "2.0", id: "1", method: "SendMessage", params: {
+    configuration: { returnImmediately: true },
+    message: { messageId: crypto.randomUUID(), role: "ROLE_USER", contextId: ctx,
+      parts: [{ text: "for " + who + ": " + subject }] } } };
+  const r = await fetch(url, { method: "POST", body: JSON.stringify(body),
+    headers: { "content-type": "application/json", authorization: "Bearer " + process.env.TOKEN } });
+  const j = await r.json().catch(() => null);
+  if (!j || j.error) { console.error("dispatch failed: " + JSON.stringify(j)); process.exit(1); }
+  const id = j.result && j.result.task && j.result.task.id;
+  console.error("dispatched task " + id + "; watching #poetry for " + watch + "s");
+}
+setTimeout(() => {
+  if (!url) process.exit(0);
+  console.error("no poem within " + watch + "s -- check: make logs-gateway GATEWAY=<poet>");
+  process.exit(1);
+}, Number(watch) * 1000);
+endef
+
+define POEM_SCRIPT
+set -eu
+CTX=$$1; SUBJECT=$$2; WHO=$$3; WATCH=$$4
+eval "$$(/var/run/asi/bin/pick-poet-gateway "$$CTX")"
+echo "context: $$CTX" >&2
+echo "peer:    $$PEER" >&2
+TOKEN=$$(cat "$$TOKEN_FILE") exec node -e '$(POEM_WATCHER_JS)' "$$URL" "$$CTX" "$$SUBJECT" "$$WHO" "$$WATCH"
+endef
+export POEM_SCRIPT
+
+.PHONY: poem
+poem: ## dispatch a poem request and watch #poetry for it -- POEM_SUBJECT=... POEM_CTX=... POEM_FOR=...
+	@$(KUBECTL) exec statefulset/$(RELEASE)-main -c openclaw -- \
+		sh -c "$$POEM_SCRIPT" _ "$(POEM_CTX)" "$(POEM_SUBJECT)" "$(POEM_FOR)" "$(POEM_WATCH)"
+
+# The channel on its own, dispatching nothing -- for watching what the poets
+# post in response to real requests coming through #asi.
+.PHONY: poetry
+poetry: ## tail #poetry -- POEM_WATCH=<seconds>
+	@$(KUBECTL) exec statefulset/$(RELEASE)-main -c openclaw -- \
+		node -e '$(POEM_WATCHER_JS)' "" "" "" "" "$(POEM_WATCH)"
 
 .PHONY: destroy
 destroy: ## uninstall the release, keeping the secret and the volumes

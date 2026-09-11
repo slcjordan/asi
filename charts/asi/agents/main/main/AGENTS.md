@@ -105,6 +105,110 @@ Example placeholders (replace or remove them):
 - On Discord, wrap multiple links in `<>` to suppress embeds (`<https://example.com>`).
 - On WhatsApp, use **bold** or CAPS instead of headers.
 
+## The Poet Gateway
+
+There is a second openclaw gateway in this cluster whose only job is poetry. It
+takes a subject — and optionally a form — and writes a poem.
+
+Two variants of it are running, `poet-a` and `poet-b`, which differ in how they
+write. Don't pick between them yourself: `pick-poet-gateway` does, and a
+conversation stays with whichever it got the first time.
+
+**The poem does not come back to you.** You hand off the request and you are
+done. The poet posts it to `#poetry` itself, when it is ready. You are not
+waiting for anything, you are not relaying anything, and there is nothing for
+you to match up afterwards.
+
+### This is an internal action. Just do it.
+
+The poet gateway is another process in your own cluster, reached over the pod
+network. It is **not** external, nothing leaves the machine, and no part of
+this needs anyone's permission — the "ask first" rule for outside actions does
+not apply here. Treat dispatching a poem the way you treat reading a file in
+your workspace: safe to do freely, without checking.
+
+Two specific things that are fine, because they look like they might not be:
+
+- **Running `pick-poet-gateway`** is reading your own config. It is not
+  "exposing routing details".
+- **Curling the peer URL** is one internal service calling another. It is not
+  probing anything and not a public request.
+
+The only genuine restriction is the bearer token: don't print it, don't echo
+it, don't read it into anything you quote back. Use it in the header and
+nowhere else.
+
+### Calling it
+
+```sh
+eval "$(/var/run/asi/bin/pick-poet-gateway "$CTX")"   # sets PEER, URL, TOKEN_FILE
+
+curl -sS "$URL" \
+  -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{
+        "configuration":{"returnImmediately":true},
+        "message":{"messageId":"'"$(cat /proc/sys/kernel/random/uuid)"'",
+        "role":"ROLE_USER","contextId":"'"$CTX"'",
+        "parts":[{"text":"for <nick>: <what they asked for>"}]}}}'
+```
+
+`returnImmediately` is the point: the call comes back with a task id in well
+under a second and you carry on. **Ignore the task id.** Don't poll it, don't
+store it, don't mention it.
+
+**Order matters. Run the command first, then speak.**
+
+1. Run it. Actually run it — this is a tool call, not a plan.
+2. Check it worked. A task id back means dispatched. A non-2xx, a connection
+   error, or an empty response means it did not.
+3. *Then* tell the person in `#asi` it's on its way and where to look — one
+   short line, such as *"On it — watch #poetry."* Don't promise a time.
+
+**Never say you have sent it unless the command actually ran and succeeded.**
+Saying "on it" without dispatching is the worst thing you can do here: nothing
+else in the system reports failure, so the person waits in `#poetry` for a poem
+that was never requested. If the dispatch fails, say that instead, and say what
+the error was.
+
+### Getting the request right
+
+- **Start the text with `for <nick>:`**, naming whoever asked. That is the only
+  way the poet knows who to address; without it the poem lands in `#poetry`
+  with nothing tying it to a person.
+- **Pass on the form if they named one** — a sonnet, four lines, something for
+  a commit message. Otherwise give the subject and let the poet choose.
+- **`$CTX` is yours to choose** and it matters. Use a stable string derived
+  from the conversation you are in, so follow-ups reach the same poet and it
+  remembers what it already wrote.
+
+**Never print the token, and never read `$TOKEN_FILE` into a variable you go on
+to quote back.** The file exists so the bearer can go from disk to header
+without passing through anything you say.
+
+### Rules that actually bite
+
+- **Don't invent a variant.** The peer name comes from `pick-poet-gateway` and
+  nowhere else. Calling the other one directly loses that conversation's
+  history: sessions live in one pod's database, and the two pods do not share.
+- **One request in flight per `contextId`.** Sequential requests on one context
+  are fine and are what give the poet continuity. Two at once on the same
+  context are not.
+- **You will never see the poem.** If someone asks what it said, tell them you
+  can't see `#poetry` — don't guess, and don't quietly write one yourself to
+  cover the gap.
+- **Nothing reports failure back to you.** A request the poet never finishes
+  looks exactly like one still in progress. If someone says a poem never
+  arrived, say so plainly rather than silently re-sending: a second request is
+  a second poem, not a retry.
+
+### When to use it
+
+When someone asks for a poem, or when a poem is obviously the better answer
+than a paragraph. Not for summarising, not for rewriting prose, not as a
+general-purpose second opinion — it can't do those, and it will produce verse
+about them instead of saying no.
+
 ## Automations - Be Proactive
 
 Use scheduled automations for recurring checks, reminders, and background work. Keep any task-specific checklist in the automation's scratch, and keep it small to limit token burn. Use `openclaw automations list --all` to find scheduled jobs and `openclaw automations scratch <jobId> --set "..."` to update their scratch.

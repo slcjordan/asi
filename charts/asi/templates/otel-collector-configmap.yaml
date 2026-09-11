@@ -10,6 +10,16 @@ The debug exporter is the whole sink: spans go to the collector's stdout and
 otlp/otlphttp exporter, or set openclaw.otel.endpoint and turn the collector
 off, when the traces need to outlive the pod.
 
+Two debug exporters, not one, and the reason is the difference between the two
+signals. Metrics arrive every `flushIntervalMs` whether or not anything
+happened; spans arrive only when an agent does something. At `detailed` one
+metrics batch is around 3000 lines, so ten seconds of idle telemetry evicts
+every span from the container log -- the retained window collapsed to about
+three minutes, and `make traces` reliably found nothing while the collector
+was in fact receiving and printing spans perfectly well. Metrics therefore
+get their own terse exporter, and spans keep the detail that is the entire
+point of running this.
+
 No span filtering, deliberately. Tool and exec spans are children of the run
 spans and carry no run id of their own, so the trace is the only thing tying a
 child to the run that spawned it -- dropping the parents to "only keep exec"
@@ -34,8 +44,12 @@ data:
       batch: {}
 
     exporters:
+      # Spans and logs: the detail is the point.
       debug:
         verbosity: {{ .Values.otelCollector.verbosity }}
+      # Metrics: one summary line per batch, so they cannot bury the spans.
+      debug/metrics:
+        verbosity: {{ .Values.otelCollector.metricsVerbosity }}
 
     extensions:
       health_check:
@@ -51,7 +65,7 @@ data:
         metrics:
           receivers: [otlp]
           processors: [batch]
-          exporters: [debug]
+          exporters: [debug/metrics]
         logs:
           receivers: [otlp]
           processors: [batch]

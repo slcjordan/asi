@@ -1,37 +1,48 @@
-{{- $name := include "asi.openclaw.fullname" . -}}
-{{- $secretMount := include "asi.secretMountPath" . -}}
+{{/*
+One StatefulSet per gateway, each with its own PVC. Separate pods with
+separate volumes are what make multi-gateway isolation free here: openclaw's
+warnings about profiles, state directories and derived ports are about several
+gateways sharing one host, and this satisfies all of them by construction.
+*/}}
+{{- include "asi.gateways" . -}}
 {{- $provenance := and .Values.openclaw.otel.enabled .Values.openclaw.otel.resource.workspace.enabled -}}
-{{- include "asi.agents" . -}}
-{{- $agents := .Values.resolvedAgents -}}
+{{- range $key, $gw := .Values.resolvedGateways }}
+{{- $name := $gw.fullname }}
+{{- $secretMount := include "asi.secretMountPath" $ }}
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: {{ $name }}
   labels:
-    {{- include "asi.labels" . | nindent 4 }}
+    {{- include "asi.labels" $ | nindent 4 }}
     app.kubernetes.io/component: openclaw
+    asi.dev/gateway: {{ $key }}
 spec:
   serviceName: {{ $name }}
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
       app.kubernetes.io/component: openclaw
+      asi.dev/gateway: {{ $key }}
   template:
     metadata:
       labels:
-        {{- include "asi.labels" . | nindent 8 }}
+        {{- include "asi.labels" $ | nindent 8 }}
         app.kubernetes.io/component: openclaw
+        asi.dev/gateway: {{ $key }}
       annotations:
-        # Rolls the pod when a rotation changes the IRC PASS or the gateway
-        # token, so it reconnects with what ergo now expects.
-        checksum/secrets: {{ include "asi.secrets.checksum" . }}
-        checksum/config: {{ include (print $.Template.BasePath "/openclaw-configmap.yaml") . | sha256sum }}
-        {{- if $agents.ids }}
-        # Rolls the pod when a persona changes, so an edit to an agent
-        # definition in git actually reaches the running agent.
-        checksum/agents: {{ include (print $.Template.BasePath "/openclaw-agents-configmap.yaml") . | sha256sum }}
-        {{- end }}
+        # Rolls the pod when a rotation changes the IRC PASS, a gateway token
+        # or an A2A bearer. Fleet-wide: the checksum covers the whole resolved
+        # map, so rotating any credential rolls every gateway, which is what
+        # rotation already did.
+        checksum/secrets: {{ include "asi.secrets.checksum" $ }}
+        # Per gateway, unlike the secrets checksum: these hash only this
+        # gateway's own config and personas, so retuning one poet's prompt
+        # leaves `main` and the other variant running.
+        checksum/config: {{ include "asi.gateway.configmapData" (dict "root" $ "gw" $gw) | sha256sum }}
+        checksum/agents: {{ include "asi.gateway.agentsConfigmapData" (dict "root" $ "gw" $gw) | sha256sum }}
     spec:
       securityContext:
         # `node` in the upstream image.
@@ -40,8 +51,8 @@ spec:
         fsGroup: 1000
       initContainers:
         - name: render
-          image: "{{ .Values.openclaw.image.repository }}:{{ .Values.openclaw.image.tag }}"
-          imagePullPolicy: {{ .Values.openclaw.image.pullPolicy }}
+          image: "{{ $.Values.openclaw.image.repository }}:{{ $.Values.openclaw.image.tag }}"
+          imagePullPolicy: {{ $.Values.openclaw.image.pullPolicy }}
           command: ["/bin/sh", "/scripts/render.sh"]
           volumeMounts:
             - name: scripts
@@ -54,15 +65,13 @@ spec:
               subPath: config-openclaw
             - name: config
               mountPath: /config
-            {{- if $agents.ids }}
             - name: agents
               mountPath: /agents
-            {{- end }}
             - name: secrets
               mountPath: {{ $secretMount }}
               readOnly: true
             - name: creds
-              mountPath: {{ include "asi.credsMountPath" . }}
+              mountPath: {{ include "asi.credsMountPath" $ }}
         {{- if $provenance }}
         # Fingerprints the workspace before openclaw can touch it, so the
         # attributes describe what this run started from. Separate from
@@ -70,8 +79,8 @@ spec:
         # mode: a fingerprint the chart could not compute must not stop the
         # bot from starting.
         - name: provenance
-          image: "{{ .Values.openclaw.image.repository }}:{{ .Values.openclaw.image.tag }}"
-          imagePullPolicy: {{ .Values.openclaw.image.pullPolicy }}
+          image: "{{ $.Values.openclaw.image.repository }}:{{ $.Values.openclaw.image.tag }}"
+          imagePullPolicy: {{ $.Values.openclaw.image.pullPolicy }}
           command: ["/bin/sh", "/scripts/provenance.sh"]
           volumeMounts:
             - name: scripts
@@ -80,15 +89,15 @@ spec:
               mountPath: /home/node/.openclaw
               subPath: openclaw
             - name: data
-              mountPath: {{ .Values.openclaw.otel.resource.workspace.store }}
+              mountPath: {{ $.Values.openclaw.otel.resource.workspace.store }}
               subPath: provenance
             - name: provenance
-              mountPath: {{ include "asi.provenanceMountPath" . }}
+              mountPath: {{ include "asi.provenanceMountPath" $ }}
         {{- end }}
       containers:
         - name: openclaw
-          image: "{{ .Values.openclaw.image.repository }}:{{ .Values.openclaw.image.tag }}"
-          imagePullPolicy: {{ .Values.openclaw.image.pullPolicy }}
+          image: "{{ $.Values.openclaw.image.repository }}:{{ $.Values.openclaw.image.tag }}"
+          imagePullPolicy: {{ $.Values.openclaw.image.pullPolicy }}
           {{- if $provenance }}
           # Only `args` is replaced, so the image's ENTRYPOINT (`tini -s --`)
           # still runs and tini is still pid 1 -- signal handling has to stay
@@ -108,7 +117,7 @@ spec:
             - sh
             - -c
             - |
-              ATTRS={{ include "asi.provenanceMountPath" . }}/attrs
+              ATTRS={{ include "asi.provenanceMountPath" $ }}/attrs
               if [ -r "$ATTRS" ]; then
                 OTEL_RESOURCE_ATTRIBUTES="${OTEL_RESOURCE_ATTRIBUTES:+$OTEL_RESOURCE_ATTRIBUTES,}$(cat "$ATTRS")"
                 export OTEL_RESOURCE_ATTRIBUTES
@@ -120,32 +129,35 @@ spec:
           env:
             - name: OPENCLAW_SKIP_ONBOARDING
               value: "1"
+            # One token per gateway: a gateway is a separate control API, and
+            # a shared bearer would make `make gateway` on one of them a
+            # credential for all of them.
             - name: OPENCLAW_GATEWAY_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "asi.secretName" . }}
-                  key: openclaw-gateway-token
-            - name: {{ .Values.openclaw.provider.envVar }}
+                  name: {{ include "asi.secretName" $ }}
+                  key: {{ $gw.tokenKey }}
+            - name: {{ $.Values.openclaw.provider.envVar }}
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "asi.secretName" . }}
+                  name: {{ include "asi.secretName" $ }}
                   key: provider-api-key
-            {{- if .Values.openclaw.otel.enabled }}
+            {{- if $.Values.openclaw.otel.enabled }}
             # Carries `agent` and `agent version` onto every exported span.
             # Neither is available as a span attribute on the tool and exec
             # spans that want them, but the exporter runs the standard env
             # resource detector, so what lands here lands on all of them. See
             # openclaw.otel.resource in values.yaml.
             - name: OTEL_RESOURCE_ATTRIBUTES
-              value: {{ include "asi.otel.resourceAttributes" . | quote }}
+              value: {{ include "asi.otel.resourceAttributes" (dict "root" $ "gw" $gw) | quote }}
             {{- end }}
-            {{- range $key, $value := .Values.openclaw.extraEnv }}
-            - name: {{ $key }}
+            {{- range $envKey, $value := $gw.extraEnv }}
+            - name: {{ $envKey }}
               value: {{ $value | quote }}
             {{- end }}
           ports:
             - name: gateway
-              containerPort: {{ .Values.openclaw.gateway.port }}
+              containerPort: {{ $.Values.openclaw.gateway.port }}
           startupProbe:
             httpGet:
               path: /startupz
@@ -164,26 +176,39 @@ spec:
             - name: data
               mountPath: /home/node/.config/openclaw
               subPath: config-openclaw
-            # Read by channels.irc.passwordFile.
+            # Read by channels.irc.passwordFile, and -- for a gateway that
+            # calls a peer -- by the agent itself, which cats the outbound
+            # bearer straight into a curl header so the token never passes
+            # through the model's context.
             - name: creds
-              mountPath: {{ include "asi.credsMountPath" . }}
+              mountPath: {{ include "asi.credsMountPath" $ }}
               readOnly: true
+            {{- if or $gw.a2a.outbound $gw.post }}
+            # Scripts the agent runs -- `pick-poet-gateway` on the caller,
+            # `post-poem` on a gateway that delivers. Mounted rather than
+            # copied into the workspace because the chart owns them: they are
+            # not persona content, and the agent should not be able to edit
+            # the thing that decides the A/B split or the thing that speaks.
+            - name: bin
+              mountPath: {{ include "asi.binMountPath" $ }}
+              readOnly: true
+            {{- end }}
             {{- if $provenance }}
             # Read by the wrapper above, not by openclaw.
             - name: provenance
-              mountPath: {{ include "asi.provenanceMountPath" . }}
+              mountPath: {{ include "asi.provenanceMountPath" $ }}
               readOnly: true
             # Read-only, and not for openclaw either: it is what lets
             # `make provenance-show` resolve a snapshot hash on a span back
             # into the contents it names. A hash nothing can dereference would
             # identify the workspace without recovering it.
             - name: data
-              mountPath: {{ .Values.openclaw.otel.resource.workspace.store }}
+              mountPath: {{ $.Values.openclaw.otel.resource.workspace.store }}
               subPath: provenance
               readOnly: true
             {{- end }}
           resources:
-            {{- toYaml .Values.openclaw.resources | nindent 12 }}
+            {{- toYaml $gw.resources | nindent 12 }}
       volumes:
         - name: scripts
           configMap:
@@ -202,23 +227,36 @@ spec:
             items:
               - key: openclaw.json
                 path: openclaw.json
-        {{- if $agents.ids }}
+        {{- if or $gw.a2a.outbound $gw.post }}
+        - name: bin
+          configMap:
+            name: {{ $name }}
+            defaultMode: 0555
+            items:
+              {{- if $gw.a2a.outbound }}
+              - key: pick-poet-gateway
+                path: pick-poet-gateway
+              {{- end }}
+              {{- if $gw.post }}
+              - key: post-poem
+                path: post-poem
+              {{- end }}
+        {{- end }}
         # `items` is what turns the flat `<id>--<file>` keys back into the
         # per-agent directories render.sh copies from.
         - name: agents
           configMap:
             name: {{ $name }}-agents
             items:
-              {{- range $id := $agents.ids }}
-              {{- range $path := index $agents.files $id }}
+              {{- range $agentId := $gw.agentIds }}
+              {{- range $path := index $gw.files $agentId }}
               - key: {{ include "asi.agents.key" (dict "path" $path) }}
-                path: {{ $id }}/{{ base $path }}
+                path: {{ $agentId }}/{{ base $path }}
               {{- end }}
               {{- end }}
-        {{- end }}
         - name: secrets
           secret:
-            secretName: {{ include "asi.secretName" . }}
+            secretName: {{ include "asi.secretName" $ }}
             defaultMode: 0400
         - name: creds
           emptyDir:
@@ -233,9 +271,10 @@ spec:
         name: data
       spec:
         accessModes: ["ReadWriteOnce"]
-        {{- with .Values.openclaw.persistence.storageClass }}
+        {{- with $gw.persistence.storageClass }}
         storageClassName: {{ . | quote }}
         {{- end }}
         resources:
           requests:
-            storage: {{ .Values.openclaw.persistence.size | quote }}
+            storage: {{ $gw.persistence.size | quote }}
+{{- end }}

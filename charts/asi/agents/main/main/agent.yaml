@@ -1,0 +1,50 @@
+# The presence of this file is what makes `agents/main/main/` an agent. The
+# outer directory is the gateway that runs it; this one is the openclaw agent
+# id. The *.md files beside it are the agent's definition and get copied into
+# its workspace at boot.
+
+# Merged verbatim into openclaw's `agents.entries.main`, so anything openclaw
+# accepts there is accepted here -- model, utilityModel, identity, skills,
+# tools, sandbox, runtime, subagents, thinkingDefault, and the rest. Empty
+# means "inherit every default", which is what this agent did before it was
+# written down here.
+#
+#   entry:
+#     identity:
+#       name: ASI
+#       emoji: "🦥"
+#     model: openai/gpt-5.4
+#     skills: []
+#     tools:
+#       profile: coding
+#
+# `workspace` is the one key not to set unless you mean it: the chart fills it
+# in as <workspaceRoot>/main and the init container seeds the same path, so
+# overriding it here moves both together but is easy to get half-right.
+entry: {}
+
+# Routing, as openclaw's top-level `bindings` entries with `agentId` filled in.
+#
+# Not optional, and not decorative. `agents.ownership: "explicit"` is set on
+# every gateway, so there is no sole-agent fallback anywhere in the fleet: a
+# surface with no matching binding fails closed and this agent simply never
+# answers on it. The chart refuses to render without at least one entry, but it
+# cannot tell whether the entries actually cover every channel the gateway
+# joins -- that part is on you.
+bindings:
+  # IRC. `openclaw.irc.channels` decides which channels the bot joins and
+  # `irc.groups` which it listens to; this decides who handles them. A binding
+  # for a channel that is not joined does nothing.
+  - match:
+      channel: irc
+      peer:
+        kind: channel
+        id: "#asi"
+
+  # A2A. `main` is the caller in this fleet and nothing calls it today, so this
+  # binding covers no traffic -- but `channels.a2a.exposeAgents` advertises
+  # this agent on the agent card, and an inbound call with no binding would
+  # fail closed silently rather than visibly. Cheaper to answer than to debug.
+  - match:
+      channel: a2a
+      accountId: "*"

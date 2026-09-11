@@ -1,7 +1,8 @@
 # asi
 
 An IRC network you own, with an assistant sitting on it: [ergo](https://github.com/ergochat/ergo)
-as the ircd and [openclaw](https://docs.openclaw.ai) attached to it as a bot.
+as the ircd and a fleet of [openclaw](https://docs.openclaw.ai) gateways
+attached to it — one on IRC, and others it reaches over A2A.
 
 Everything is driven from the repository root `Makefile`, which reads
 `KUBE_CONTEXT` and `KUBE_NAMESPACE` from the selected `envs/*.mk`:
@@ -10,10 +11,16 @@ Everything is driven from the repository root `Makefile`, which reads
 make env-dev        # select an environment
 make image          # build the openclaw image and load it into the cluster
 make deploy         # install or upgrade
-make secrets-rotate # re-derive credentials and roll both workloads
+make gateways       # which gateways this chart deploys
+make poem           # end-to-end test of the A2A edge (dispatch, then watch #poetry)
+make poetry         # tail #poetry
+make secrets-rotate # re-derive credentials and roll every workload
 make traces         # exported spans, grouped by trace id
 make help           # everything else
 ```
+
+Targets that act on one gateway take `GATEWAY=<name>` and default to `main`:
+`make logs-gateway`, `make restart-gateway`, `make gateway`, `make provenance`.
 
 `make image` is a prerequisite of the first `make deploy`, not a step of it —
 it is slow, it needs a network, and it only has to run again when the openclaw
@@ -73,19 +80,174 @@ is no registry in the loop; on any other context it falls back to
 `docker push`, which assumes `openclaw.image.repository` names somewhere the
 cluster can actually pull from.
 
-## Agents
+## The fleet
 
-Agents are defined in [`agents/`](agents/), one directory per agent, and
-rendered into openclaw's `agents.entries` and `bindings` at template time. The
-directory name is the agent id; a directory counts as an agent if it holds an
-`agent.yaml`. Adding one needs no change to `values.yaml`.
+The chart deploys one openclaw gateway per entry under `gateways` in
+`values.yaml`. Today that is three:
 
 ```
-agents/main/
+ ┌──────────┐  #asi   ┌─────────────┐       A2A       ┌──────────────────┐
+ │          │<───────>│ main        │────────────────>│ poet-a           │
+ │ ergo     │         │ agent: main │ fire-and-forget │ agent: poet      │
+ │ irc      │         │ :18789      │───────────┐     └──────────────────┘
+ │ 6667/97  │         └─────────────┘           │     ┌──────────────────┐
+ │          │                                   └────>│ poet-b           │
+ │          │                                         │ agent: poet      │
+ │          │<──── #poetry ───────────────────────────│ variant · :18789 │
+ └──────────┘      (poems, posted by the poets)       └──────────────────┘
+
+        every gateway ──> otel-collector · otlp/http 4318
+```
+
+A gateway is **one values entry plus one directory of agent definitions**.
+Names, Services, PVCs, ConfigMaps, A2A peer maps, secret keys and telemetry
+identity all derive from those two, so the next gateway costs an entry and a
+directory and nothing else. The chart refuses to render if the two disagree in
+either direction — a gateway with no agents, or an `agents/<name>/` with no
+gateway.
+
+The second gateway is a deliberate placeholder: its agent takes a subject and
+writes a poem, with one tool and no side effects. The deliverable is the
+fleet, and a placeholder keeps the agent from competing with the plumbing for
+debugging attention. See [`docs/design/gateway-fleet.md`](../../docs/design/gateway-fleet.md)
+for the reasoning, and for the A2A source findings the chart is built on.
+
+### The A2A edge
+
+`a2a` is bundled in the image at `/app/extensions/a2a`, so like
+`diagnostics-otel` it needs only a slot in `plugins.allow` and an enabled entry
+— no npm staging and no managed-root trust dance. All three of its routes
+register with `auth: "plugin"`, so the per-peer bearers are the entire auth
+story and the gateway token is not involved.
+
+Declaring an edge once wires both ends. `gateways.main.a2a.calls: [poet-a]`
+gives `main` a peer entry with a URL and an outbound bearer, gives `poet-a` a
+matching inbound peer entry, and mints **both** directions of the token —
+openclaw's peer schema requires `token` even on a peer that is only ever
+called. Keys are named for what the caller addresses:
+`a2a-token-<target>-from-<caller>`.
+
+**Peer tokens are literals, not SecretRefs.** `token` is a plain string
+compared as a digest against the presented bearer, and the plugin ships no
+secret-contract API, so the real value has to be in `openclaw.json`. The
+ConfigMap therefore carries `__ASI_SECRET_*__` placeholders and `render.sh`
+substitutes them from the Secret mount at boot — the same treatment the IRC
+PASS gets, and what keeps `kubectl get configmap` from being a credential
+disclosure.
+
+**The plugin's own outbound path discards the reply.** `sendA2aChannelText`
+hardcodes `returnImmediately: true` and returns only a task id, so anything
+that needs an answer calls `/a2a/v1` itself. That is why `main`'s agent has a
+curl paragraph in its `AGENTS.md` and a bearer on tmpfs rather than a
+`message -> a2a:poet` binding.
+
+### Calls are fire-and-forget, and the answer comes back over IRC
+
+`main` sends `returnImmediately`, discards the task id, and moves on. It never
+waits and never sees the poem. Blocking would make `main` the correlation
+point for every request in `#asi` — serialized behind whichever poem is in
+flight, under a FIFO-per-context reply rule that swaps answers when you get it
+wrong — and keeping that out of the top-level gateway is the whole point.
+
+The consequence is that the answer cannot come back on the call, so the poets
+deliver it themselves: they are on IRC, posting to **`#poetry`**. A different
+channel from `main`, deliberately — two openclaw instances in one channel
+answer each other forever, and `requireMention: true` on `#poetry` is what
+stops the two poets doing it to each other.
+
+Two things follow that are worth knowing before reading the poet's config:
+
+- **The poet is not toolless.** Its source channel is A2A and its destination
+  is IRC; openclaw has no automatic path between the two, so it runs
+  **`post-poem`**, a script the chart ships in its ConfigMap. Deliberately not
+  openclaw's `message(action="send")` — see below.
+- **Nothing reports failure.** A request the poet never finishes looks exactly
+  like one in progress. No retry, no dead-letter, no error path back. Accepted
+  on purpose; the alternative is the correlation state this design avoids.
+
+`make poem` dispatches a request and watches `#poetry` for the result, exiting
+non-zero if nothing arrives. `make poetry` just tails the channel.
+
+### A/B without a router
+
+`poet-a` and `poet-b` run the same agent id with different personas. There is
+no proxy in front of them: the caller picks, with `pick-poet-gateway` (mounted
+from the gateway ConfigMap at `/var/run/asi/bin`), and the choice is recorded
+in `main`'s workspace so it never has to be recomputed.
+
+Stickiness is the reason. The session for a `(peer, contextId)` lives in one
+pod's sqlite on its own PVC, so a context that lands on the other variant loses
+its history — a stateless splitter in front of a stateful protocol is the wrong
+shape. Two Deployments behind one Service is precisely the broken case, which
+is why each gateway's Service selects on `asi.dev/gateway` and not on the
+component label alone.
+
+The script does weighted rendezvous hashing (`gateways.<name>.weight`), but the
+hashing is not the load-bearing part — the assignment log is. Adding a third
+variant cannot move an existing conversation, because the hash only ever
+assigns a context that has no record yet.
+
+Variants are separable in telemetry for free: `service.name` is derived per
+gateway, so spans arrive as `openclaw-gateway-poet-a` and
+`openclaw-gateway-poet-b` with no flag-evaluation events needed on them.
+
+### The task machinery is entirely unused
+
+Because calls are fire-and-forget, `GetTask` is never called, the task store is
+never read, and the FIFO-per-context reply hazard never fires — `main` throws
+the task id away as soon as it has one. The findings about all three are still
+in the design doc because they become live again the moment anything needs a
+result back; today they describe machinery nothing touches.
+
+What is live is thinner: **one `contextId` per conversation**, reused across
+requests so the poet keeps its memory of it, and one request in flight on it at
+a time.
+
+### Two things the first deploy taught us
+
+**`messages.visibleReplies` has no safe default.** Unset, openclaw takes the
+delivery contract from the harness, and on A2A that resolved to `message_tool`
+— the agent's final text withheld unless it calls the message tool. A toolless
+poet wrote a correct poem, completed successfully, and delivered nothing, with
+`[source-reply/private-final]` in the log as the only trace. The chart now
+writes the key explicitly for every gateway.
+
+**Cross-channel delivery had to become a shell command.** Answering into a
+channel that is not the turn's source channel needs `message(action="send")`,
+and the model would not call it — poem written, turn `completed`, text
+discarded, three times running. That is a documented weakness (*"models can
+answer final text but fail to understand that source-visible output must be
+sent with `message(action=send)`"*), and the recommended workaround,
+`automatic`, delivers to the **source** channel — which is A2A, not `#poetry`.
+The reliable path couldn't reach the destination and the path that could wasn't
+reliable.
+
+Three prompt revisions didn't move it. Giving the poet a `post-poem` script
+and telling it to run that worked first try. **A delivery tool competes with
+the model's belief that its final text is its answer; an ordinary action tool
+doesn't.** It also fixed the nick — openclaw opened a fresh IRC connection per
+cross-channel send and collided with its own persistent one, posting as
+`poet-a_`; with no openclaw IRC channel on the poets, `post-poem` takes
+`poet-a` cleanly. And it makes the bot loop structural rather than policed:
+the poets are never in `#poetry` between posts.
+
+## Agents
+
+Agents are defined in [`agents/`](agents/), one directory per gateway and one
+per agent inside it, rendered into that gateway's `agents.entries` and
+`bindings` at template time. The inner directory name is the agent id; a
+directory counts as an agent if it holds an `agent.yaml`.
+
+```
+agents/main/main/
   agent.yaml     # agents.entries.main, plus routing bindings
   SOUL.md        # the definition -- injected into the system prompt
   AGENTS.md  BOOTSTRAP.md  IDENTITY.md  USER.md
 ```
+
+Agent ids only have to be unique within a gateway, which is what lets both poet
+variants keep the id `poet` — their cards and bindings match, so the caller's
+choice of gateway is the only difference between them.
 
 The `*.md` files are the agent's behaviour: openclaw injects the workspace's
 bootstrap files into the system prompt on every turn. They must be *in the
@@ -101,6 +263,10 @@ checksum sits on the pod template. Anything the agent wrote over one of those
 files does not survive a restart; everything else in the workspace is the
 agent's own and is never touched.
 
+That checksum is **per gateway** — there is one agents ConfigMap each — so
+retuning `poet-b`'s prompt rolls `poet-b` and leaves `main` and `poet-a`
+running, which is what makes changing one arm of an A/B cheap.
+
 This also makes the workspace fingerprint in [Telemetry](#the-trace-id-is-the-run-id)
 mean something sharper — `openclaw.workspace.tree` becomes a function of what
 is committed here, so identical repo content produces an identical hash. The
@@ -108,10 +274,17 @@ seeding runs in the `render` init container and the fingerprint in `provenance`,
 which runs after it, so the hash describes the definitions the repo just
 installed.
 
-**Adding a second agent changes the rules** — bindings become mandatory,
-workspaces move to per-agent subdirectories, and ambient services need an
-explicit owner. [`agents/README.md`](agents/README.md) covers all four traps;
-the chart refuses to render on the one that would otherwise silence the bot.
+**Bindings are mandatory, for every agent on every gateway.**
+`agents.ownership: "explicit"` is set fleet-wide, so there is no sole-agent
+fallback anywhere: a surface with no matching binding fails closed and the
+agent goes quiet. The chart refuses to render without at least one entry — but
+it can only check the list is non-empty, not that it covers every channel the
+gateway joins. [`agents/README.md`](agents/README.md) has the rest of the
+traps.
+
+**Workspaces never move.** Each agent's is `<workspaceRoot>/<agentId>`, always,
+with no sole-agent special case, so adding an agent or a gateway cannot move an
+existing one's workspace out from under it.
 
 ## Telemetry
 
@@ -230,8 +403,60 @@ Two things worth knowing before trusting these:
   three attributes together.
 
 Resource attributes describe the *process*, not the run. That is accurate here
-because this pod runs a single agent, and is the thing to revisit if that ever
-stops being true.
+because each gateway pod runs a single agent, and is the thing to revisit if
+that ever stops being true.
+
+Both the service name and these attributes are derived **per gateway**:
+`service.name` is `<prefix>-<gateway>`, `openclaw.agent` is the id of the one
+agent that gateway runs, and the workspace fingerprint covers that agent's own
+workspace. Shared, every span in the fleet would claim `openclaw-gateway` and
+`main`, and the two poet variants would be indistinguishable in the collector —
+which is exactly the comparison the fleet exists to make. The workspace path
+was the sharpest of the three: hardcoded, it would have fingerprinted the
+*parent* of every workspace the moment a second agent existed, silently and
+with no render error. A gateway that grows a second agent still falls back to
+the root and inherits that imprecision; there is one set of resource attributes
+per process and no honest way to make it describe two workspaces.
+
+### Metrics will bury your spans
+
+The collector prints to its own stdout and that is the entire store, so the
+container log *is* the trace view — and it is a fixed-size window. Metrics
+arrive every `flushIntervalMs` whether or not anything happened; spans arrive
+only when an agent does something. At `detailed`, one metrics batch is around
+3,000 lines, so ten seconds of an idle cluster evicts every span from the log.
+
+That is why metrics get their own terse exporter (`otelCollector.metricsVerbosity`,
+default `basic`) while spans keep `detailed`. Before the split the retained
+window was about three minutes and `make traces` reliably found nothing —
+while the collector was receiving and printing spans perfectly well. If you
+ever need metric *values*, raise `metricsVerbosity` temporarily and expect
+spans to become unreadable while you do.
+
+The collector's own counters settle this question in one command, and are
+worth knowing about because the debug exporter tells you nothing:
+
+```
+kubectl port-forward deploy/<release>-otel-collector 18888:8888
+curl -s localhost:18888/metrics | grep -E "receiver_accepted|exporter_sent"
+```
+
+`otelcol_receiver_accepted_spans` versus `otelcol_exporter_sent_spans`
+separates "openclaw never sent it" from "the collector dropped it" from "it
+was printed and scrolled away".
+
+### Tool and exec spans do not appear
+
+`openclaw.tool.execution` and `openclaw.exec` spans — the two surfaces the
+table above names — have not been observed, on either gateway, including turns
+that demonstrably ran shell commands. The corresponding *metrics*
+(`openclaw.tool.execution.duration_ms`) do export, so openclaw is observing the
+executions; they just do not become spans.
+
+The likely explanation is that the `codex` harness runs tools in its own
+app-server process, so openclaw's exec instrumentation never sees the child —
+but that is a hypothesis, not a verified finding. What is verified: run,
+harness, model and message spans all export correctly and share a trace id.
 
 ### The plugin is bundled, not installed
 
@@ -253,15 +478,25 @@ is true fails the render rather than deploying a pod that exports silence.
 
 ## Credentials
 
-Four values live in one Secret, `<release>-secrets`. Three are **generated** by
-the chart; one is **supplied** by you. The distinction is the whole design:
+Everything lives in one Secret, `<release>-secrets`. All but one are
+**generated** by the chart; `provider-api-key` is **supplied** by you. The
+distinction is the whole design.
 
-| Key                      | Origin    | Used by                                              |
-| ------------------------ | --------- | ---------------------------------------------------- |
-| `irc-server-password`    | generated | shared -- ergo's `PASS` gate, openclaw's `passwordFile` |
-| `irc-oper-password`      | generated | ergo, for `/OPER admin <password>`                   |
-| `openclaw-gateway-token` | generated | openclaw's control UI and API                        |
-| `provider-api-key`       | supplied  | openclaw's LLM provider                              |
+Which keys exist is *derived from the fleet*, not listed — add a gateway or an
+A2A edge in `values.yaml` and its credentials are minted with no second edit.
+`make secrets-show` prints whatever the current fleet came to:
+
+| Key                                | Origin    | Used by                                                 |
+| ---------------------------------- | --------- | ------------------------------------------------------- |
+| `irc-server-password`              | generated | shared — ergo's `PASS` gate, each joining gateway's `passwordFile` |
+| `irc-oper-password`                | generated | ergo, for `/OPER admin <password>`                      |
+| `openclaw-gateway-token-<gateway>` | generated | that gateway's control UI and API — one per gateway, so `make gateway` on one is not a credential for all |
+| `a2a-token-<target>-from-<caller>` | generated | the bearer `<caller>` presents when it addresses `<target>` |
+| `provider-api-key`                 | supplied  | every gateway's LLM provider                            |
+
+Both directions of every declared edge exist, whether or not both are used:
+openclaw's peer schema requires `token` even on a peer that is only ever
+called.
 
 `make deploy` is idempotent. On upgrade the chart reads the live Secret back
 with Helm's `lookup` and preserves what it finds, so there is no bootstrap
@@ -270,10 +505,12 @@ nothing and rolls nothing.
 
 `make secrets-rotate` bumps a `generation` counter, which is itself stored in
 the Secret. Generated values are re-derived only when the requested generation
-differs from the recorded one; a `checksum/secrets` annotation on both
-StatefulSets then rolls the pods that need the new values. The counter is read
-back out of the cluster rather than tracked in a file, so there is no local
-state to drift.
+differs from the recorded one; a `checksum/secrets` annotation on every
+StatefulSet then rolls the pods. That checksum covers the *whole* resolved map,
+so rotating any one credential rolls the entire fleet — consistent with how
+rotation already behaved, and cheaper to reason about than a per-gateway slice.
+The counter is read back out of the cluster rather than tracked in a file, so
+there is no local state to drift.
 
 The supplied provider key is preserved across a rotation, and preserved when
 passed in empty — nothing in the chart could recreate it. `make deploy` pipes
@@ -299,9 +536,34 @@ than from its environment, where its own agent could read it back. It refuses a
 `passwordFile` that is a symlink, and every key in a Kubernetes Secret mount is
 one, so its init container copies the value onto a tmpfs as a regular file.
 
+### Where the A2A tokens actually go
+
+Two places, for two different readers.
+
+**Into `openclaw.json`, as literals.** openclaw compares
+`channels.a2a.peers.*.token` as a plain string; it is not a SecretRef and it
+resolves no `${ENV}` template, whatever the channel doc implies. So the chart
+has to put the real value in the file — but it puts a `__ASI_SECRET_*__`
+placeholder in the *ConfigMap* and has `render.sh` substitute it from the
+Secret mount at boot, so `kubectl get configmap` stays free of credentials. The
+value passes through sed's argv, which is safe in this one place: Kubernetes
+does not share a PID namespace between containers by default, and the init
+container has exited before the gateway — and therefore the agent's shell —
+ever starts.
+
+**Onto tmpfs, for the agent.** A gateway that calls a peer also gets
+`/var/run/asi/creds/a2a-<peer>-outbound`. That one is read by the *agent*, not
+by openclaw: the calling convention is a curl, so the token goes from disk
+straight into a header and never passes through the model's context. Same
+handling as the IRC PASS, for the same reason.
+
+This is worth re-checking on an openclaw upgrade. It came from reading the
+plugin's TypeScript inside the image, and the published docs disagree with the
+source on exactly this point — see the design doc's *Re-deriving the findings*.
+
 ## What has to be true before the bot answers
 
-Reaching a reply in `#asi` clears five independent gates. Each one fails
+Reaching a reply in `#asi` clears six independent gates. Each one fails
 quietly — the gateway logs `ready`, the bot sits in the channel, and nothing
 looks broken — so they are worth knowing as a set. In order:
 
@@ -311,7 +573,15 @@ looks broken — so they are worth knowing as a set. In order:
 | channel is allowlisted | `irc.groups` has an entry for it | `drop channel #asi (not allowlisted)` |
 | sender is allowlisted | that entry's `allowFrom` | `drop group sender <mask> (policy=allowlist)` |
 | message addresses the bot | that entry's `requireMention` | `drop channel #asi (missing-mention)` |
+| a binding matches | that agent's `bindings` in `agent.yaml` | silence — `ownership: explicit` is set fleet-wide, so there is no sole-agent fallback and an uncovered surface fails closed |
 | model and harness load | `openclaw.plugins.allow` names them | bot replies `No reply was generated for this message`; log shows `Agent harness runtime "codex" is unavailable` |
+
+The binding gate is new with the fleet and is the one that changed behaviour
+for `main`: it used to be routed by openclaw's sole-agent fallback and is now
+routed by an explicit binding. The chart refuses to render when an agent has
+*no* bindings at all, but it cannot tell whether the ones it has cover every
+channel the gateway joins — bind `#notes` while joining `#asi` and it renders
+fine and answers nothing.
 
 The last one is the least obvious and the easiest to hit again. `plugins.allow`
 is an *exclusive* allowlist over every plugin, not just channels — the model
@@ -383,6 +653,18 @@ restart` is the fix, and the nick stays unregistered.
 - **`pullPolicy` is `IfNotPresent` for openclaw** because the image is
   side-loaded rather than pulled. `Always` would fail on a cluster that already
   has the image and no way to fetch it.
+- **Every gateway runs the same image.** A variant differs by prompt or model,
+  never by build, so `make image` is still one build for the whole fleet.
+- **A2A does no NAT traversal.** It is HTTP JSON-RPC to a URL the caller must
+  already be able to reach, and `advertisedUrl` exists only so a proxy can
+  front it. If a gateway ever leaves the cluster the peer URL changes and
+  nothing else does; openclaw's answers to an unroutable peer (Tailscale Serve,
+  Reef's relay) sit below A2A and are a different channel and trust model.
+- **The A2A task store is per-process and per-peer.** In-memory, pruned at 24h
+  or 500 entries, cleared on `stop()`, and scoped to the peer that created the
+  task. A pod roll loses the running job *and* the handle, and the next
+  `GetTask` returns `-32001 Task not found` — indistinguishable from expired.
+  Don't build anything on it surviving a restart.
 - **`make irc` needs a TLS-aware client invocation.** ergo's 6697 listener is
   TLS-only and its certificate is self-signed, so a client has to be told to
   use TLS and told not to verify. No client infers either from the port
@@ -401,15 +683,16 @@ restart` is the fix, and the nick stays unregistered.
   such nick` while `#asi` sits empty, and openclaw logs nothing at all. No
   retry fires, because from the plugin's side the connection *succeeded* — the
   reconnect monitor only watches for the socket closing. `make
-  restart-openclaw` is the fix, and is deliberately narrower than `make
-  restart`: rolling ergo would disconnect everyone on the network to repair
-  one client. A clean restart never trips this in the first place — SIGTERM
+  restart-gateway` is the fix (it defaults to `main`, the only gateway on
+  IRC), and is deliberately narrower than `make restart`: rolling ergo would
+  disconnect everyone on the network to repair one client. A clean restart never trips this in the first place — SIGTERM
   closes the socket and ergo reaps the session at once, which is why `make
   deploy` is unaffected.
 - **A crash-looping pod blocks its own replacement.** A StatefulSet rolling
   update will not proceed past a pod that never becomes Ready, so a change that
   fixes a crash loop needs the pod deleted by hand — or rolled with
-  `make restart-ergo` / `make restart-openclaw`, whichever is stuck.
+  `make restart-ergo` / `make restart-gateway GATEWAY=<name>`, whichever is
+  stuck.
 
 ## Beyond a dev cluster
 

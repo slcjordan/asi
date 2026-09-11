@@ -390,10 +390,12 @@ cost on the grounds that there is no production and the cluster is rebuildable
 -- which is true today and stops being true the moment this design starts
 collecting. Doing it now is free. Doing it in a month costs the month.
 
-**Fleet steps 2-5 are not needed until the very end.** A2A, `git-a`, the
-calling convention and `git-b` matter only for running two agent variants to
+**Fleet steps 2-5 are not needed until the very end.** A2A, `poet-a`, the
+calling convention and `poet-b` matter only for running two agent variants to
 compare, which is the last phase here and the one the arithmetic says is
-slowest to pay off.
+slowest to pay off. Those steps now stand up a placeholder poet rather than a
+git agent, which does not change the ordering: what this design needs from them
+is the variant machinery, not the second agent's subject matter.
 
 **The router is not a fleet concern.** Stated again because the two are easy to
 conflate: the fleet doc's *no router component* applies to A2A traffic between

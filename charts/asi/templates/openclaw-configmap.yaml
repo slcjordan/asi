@@ -1,17 +1,85 @@
-{{- $secretMount := include "asi.secretMountPath" . -}}
-{{- $credsMount := include "asi.credsMountPath" . -}}
-{{- $irc := .Values.openclaw.irc -}}
+{{/*
+One ConfigMap per gateway: openclaw.json, the init-container scripts, and the
+one script the *agent* runs.
+
+The body is a named template rather than inline, because the StatefulSet needs
+the identical bytes to compute `checksum/config`. Including the whole rendered
+template file the way the single-gateway chart did would now hash every
+gateway's config into every gateway's pod annotation, so a change to one poet
+would roll the entire fleet.
+*/}}
+{{- define "asi.gateway.configmapData" -}}
+{{- $root := .root -}}
+{{- $gw := .gw -}}
+{{- $secretMount := include "asi.secretMountPath" $root -}}
+{{- $credsMount := include "asi.credsMountPath" $root -}}
+{{/*
+Every allowed plugin gets an enabled entry.
+
+`plugins.allow` is an allowlist and nothing more: it *permits* a plugin to
+load, and `plugins.entries.<id>.enabled` is what actually turns it on. Naming
+one without the other is the failure this chart shipped with, and it is
+invisible -- `plugins.allow` reads like the switch, `openclaw config validate`
+passes, and the gateway starts clean.
+
+What it cost: `codex` sat in `allow` with no entry, so the agent harness never
+loaded. The OpenAI *provider* did, so the bot talked normally and looked
+entirely healthy -- while having no shell, no exec, and no way to run a tool.
+Asked to do something, it answered as though it had. A harness is not
+optional equipment for an agent that is supposed to act.
+
+Deriving the entries from the list instead means `allow` means what this
+chart's documentation has always claimed it means, and the two can no longer
+disagree. Entries below still override: `diagnostics-otel` and `a2a` add
+their own config on top.
+*/}}
+{{- $entries := dict -}}
+{{- range $plugin := $root.Values.openclaw.plugins.allow -}}
+{{- $_ := set $entries $plugin (dict "enabled" true) -}}
+{{- end -}}
+{{/*
+`messages.visibleReplies` is written unconditionally and never left to the
+harness default. Unset, openclaw resolves it from the agent harness's
+`deliveryDefaults.sourceVisibleReplies`, and on a non-WebChat surface -- which
+A2A is -- that lands on `message_tool`: the agent's final text is withheld
+unless it calls message(action="send"). A toolless agent then completes its
+run, logs `[source-reply/private-final]`, and delivers nothing, while the
+caller's blocking SendMessage returns an empty artifact. See values.yaml.
+*/}}
+{{- $config := dict
+      "gateway" (dict
+        "mode" "local"
+        "bind" $root.Values.openclaw.gateway.bind)
+      "messages" (dict
+        "visibleReplies" $gw.messages.visibleReplies)
+      "plugins" (dict
+        "allow" $root.Values.openclaw.plugins.allow
+        "entries" $entries)
+      "channels" dict -}}
+{{- $channels := get $config "channels" -}}
+{{- $irc := $gw.irc -}}
+{{- if $irc.enabled -}}
 {{/*
 `groupPolicy: allowlist` admits a channel by finding an entry for it under
 channels.irc.groups -- the entry's *presence* is the allowance, so an empty
 one is complete. Left unset, every joined channel gets an empty entry, since a
-bot that joins a channel and then ignores it is never the intent.
+bot that joins a channel and then listens to it is the usual intent.
+
+`listen: false` is the exception, and it is the one case where joining a
+channel and then ignoring it *is* the intent: the gateway is there to post,
+not to answer. It renders no entries at all, so every inbound message is
+dropped with `drop channel <name> (not allowlisted)` while `channels` still
+joins. That is what keeps the two poets in #poetry from treating each other's
+poems as prompts.
 */}}
-{{- $groups := $irc.groups -}}
+{{- $groups := dict -}}
+{{- if $irc.listen -}}
+{{- $groups = $irc.groups -}}
 {{- if not $groups -}}
 {{- $groups = dict -}}
 {{- range $irc.channels -}}
 {{- $_ := set $groups . $irc.groupDefaults -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{/*
@@ -39,10 +107,10 @@ would be the service name, which is not among the certificate's names
 (ergo.test, localhost, 127.0.0.1, ::1), so hostname verification fails too.
 Traffic stays on the pod network. ergo.tlsPort is for humans, via `make irc`.
 */}}
-{{- $ircConfig := dict
+{{- $_ := set $channels "irc" (dict
       "enabled" true
-      "host" (include "asi.ergo.fullname" .)
-      "port" (int .Values.ergo.plainPort)
+      "host" (include "asi.ergo.fullname" $root)
+      "port" (int $root.Values.ergo.plainPort)
       "tls" false
       "nick" $irc.nick
       "username" $irc.username
@@ -51,7 +119,9 @@ Traffic stays on the pod network. ergo.tlsPort is for humans, via `make irc`.
       "dmPolicy" $irc.dmPolicy
       "groupPolicy" $irc.groupPolicy
       "groups" $groups
-      "passwordFile" (printf "%s/irc-server-password" $credsMount) -}}
+      "passwordFile" (printf "%s/irc-server-password" $credsMount)) -}}
+{{- $_ := set $entries "irc" (dict "enabled" true) -}}
+{{- end -}}
 {{/*
 No `nickserv` block, deliberately. openclaw's nick recovery sends
 `GHOST <nick> <password>` before registration completes -- Atheme/Anope syntax
@@ -61,38 +131,53 @@ bot its nick outright: the plugin speaks no SASL, so it is unauthenticated at
 NICK time, and ergo's `nick-reservation: strict` refuses a reserved nick to an
 unauthenticated client. Measured, not assumed -- see the README.
 */}}
-{{- $entries := dict "irc" (dict "enabled" true) -}}
-{{- $config := dict
-      "gateway" (dict
-        "mode" "local"
-        "bind" .Values.openclaw.gateway.bind)
-      "plugins" (dict
-        "allow" .Values.openclaw.plugins.allow
-        "entries" $entries)
-      "channels" (dict "irc" $ircConfig) -}}
 {{/*
-Agents, from charts/asi/agents/. `ownership: "explicit"` is set only for a
-fleet: openclaw stamps it when a multi-agent config is created and says a sole
-agent needs no marker, so setting it unconditionally would opt a single agent
-out of the fallback that is currently routing every message to it.
+A2A, the channel that carries traffic between gateways. Bundled at
+/app/extensions/a2a, so like diagnostics-otel it needs only a slot in
+plugins.allow and an enabled entry -- no npm staging, no managed-root trust
+dance. All three of its routes register with `auth: "plugin"`, so the per-peer
+bearers below are the entire auth story; the gateway token is not involved.
+
+Same silent-nothing failure mode as the exporter, so the same render-time
+refusal: the plugin would not load, the config would look right, and
+/.well-known/agent-card.json would simply keep 404ing.
+
+Peer tokens are literals. `token` is a plain string compared as a digest
+against the presented bearer, and `a2a` ships no secret-contract-api.ts the way
+telegram does, so it appears nowhere in openclaw's SecretRef surface -- the
+channel doc's `"${A2A_HERMES_TOKEN}"` notwithstanding. What goes in the
+ConfigMap is therefore a placeholder, and render.sh substitutes the real value
+from the Secret mount at boot.
 */}}
-{{- include "asi.agents" . -}}
-{{- $agents := .Values.resolvedAgents -}}
-{{- if $agents.ids -}}
+{{- if $gw.a2a.enabled -}}
+{{- if not (has "a2a" $root.Values.openclaw.plugins.allow) -}}
+{{- fail (printf "gateway %q has the A2A channel enabled but openclaw.plugins.allow does not name \"a2a\" -- plugins.allow is an exclusive allowlist, so the channel would not load, /a2a/v1 would not exist, and every call from a peer would 404" $gw.key) -}}
+{{- end -}}
+{{- $_ := set $channels "a2a" (dict
+      "enabled" true
+      "advertisedUrl" $gw.url
+      "exposeAgents" $gw.agentIds
+      "peers" $gw.a2a.peers) -}}
+{{- $_ := set $entries "a2a" (dict "enabled" true) -}}
+{{- end -}}
+{{/*
+Agents, from charts/asi/agents/<gateway>/. `ownership: "explicit"` is set on
+every gateway now: it opts each one out of openclaw's sole-agent fallback, so
+routing is binding-driven everywhere and an uncovered surface goes quiet
+rather than defaulting to the only agent there is. Coherent with the
+always-required bindings, and the one part of dropping `$multi` with
+behavioural teeth -- see docs/design/gateway-fleet.md#chart-shape.
+*/}}
 {{- $agentDefaults := merge
       (dict
-        "workspace" .Values.openclaw.agents.workspaceRoot
-        "skipBootstrap" .Values.openclaw.agents.skipBootstrap)
-      .Values.openclaw.agents.defaults -}}
-{{- $agentsConfig := dict "defaults" $agentDefaults "entries" $agents.entries -}}
-{{- if $agents.multi -}}
-{{- $_ := set $agentsConfig "ownership" "explicit" -}}
-{{- end -}}
-{{- $_ := set $config "agents" $agentsConfig -}}
-{{- if $agents.bindings -}}
-{{- $_ := set $config "bindings" $agents.bindings -}}
-{{- end -}}
-{{- end -}}
+        "workspace" $root.Values.openclaw.agents.workspaceRoot
+        "skipBootstrap" $root.Values.openclaw.agents.skipBootstrap)
+      $root.Values.openclaw.agents.defaults -}}
+{{- $_ := set $config "agents" (dict
+      "defaults" $agentDefaults
+      "ownership" "explicit"
+      "entries" $gw.entries) -}}
+{{- $_ := set $config "bindings" $gw.bindings -}}
 {{/*
 OpenTelemetry export. `diagnostics.enabled` is the in-process event surface and
 `diagnostics.otel` the exporter that subscribes to it; both are required, and
@@ -110,19 +195,19 @@ ship. The plugin would simply not load, `diagnostics.otel` would sit in
 openclaw.json looking correct, and no span would ever leave the pod -- the same
 shape of silent nothing as a channel that is joined but not allowlisted.
 */}}
-{{- if .Values.openclaw.otel.enabled -}}
-{{- if not (has "diagnostics-otel" .Values.openclaw.plugins.allow) -}}
+{{- if $root.Values.openclaw.otel.enabled -}}
+{{- if not (has "diagnostics-otel" $root.Values.openclaw.plugins.allow) -}}
 {{- fail "openclaw.otel.enabled is true but openclaw.plugins.allow does not name \"diagnostics-otel\" -- plugins.allow is an exclusive allowlist, so the exporter would not load and nothing would be exported" -}}
 {{- end -}}
 {{- $_ := set $entries "diagnostics-otel" (dict "enabled" true) -}}
-{{- $otel := .Values.openclaw.otel -}}
+{{- $otel := $root.Values.openclaw.otel -}}
 {{- $_ := set $config "diagnostics" (dict
       "enabled" true
       "otel" (dict
         "enabled" true
-        "endpoint" (include "asi.otel.endpoint" .)
+        "endpoint" (include "asi.otel.endpoint" $root)
         "protocol" "http/protobuf"
-        "serviceName" $otel.serviceName
+        "serviceName" $gw.otelServiceName
         "traces" $otel.traces
         "metrics" $otel.metrics
         "logs" $otel.logs
@@ -130,160 +215,374 @@ shape of silent nothing as a channel that is joined but not allowlisted.
         "flushIntervalMs" (int $otel.flushIntervalMs)
         "captureContent" $otel.captureContent)) -}}
 {{- end -}}
+# `passwordFile` keeps the IRC PASS out of this ConfigMap and out of the pod's
+# environment, where openclaw's own agent could read it back. The A2A peer
+# tokens have to be literals in the file rather than references, so they are
+# `__ASI_SECRET_*__` placeholders here and render.sh substitutes them.
+openclaw.json: |
+  {{- $config | toPrettyJson | nindent 2 }}
+
+render.sh: |
+  #!/bin/sh
+  # Runs as an init container, in the openclaw image.
+  set -eu
+
+  # Both directories are subPaths of the same PVC, so they may not exist yet
+  # on a fresh volume.
+  mkdir -p /home/node/.openclaw /home/node/.config/openclaw
+
+  # The chart is the source of truth for openclaw.json: anything openclaw
+  # wrote to it in place (channels.irc.configWrites) is replaced on restart.
+  cp /config/openclaw.json /home/node/.openclaw/openclaw.json
+
+  # Same rule for the plugin tree, and for the same reason: @openclaw/irc is
+  # baked into the image, but openclaw only trusts a plugin loaded from its
+  # managed root -- which is here, on the volume. Replaced wholesale rather
+  # than merged, so a version bump actually takes effect and the project
+  # directory of a superseded version does not linger beside it. Anything
+  # installed by hand into a running pod does not survive the restart.
+  rm -rf /home/node/.openclaw/npm
+  cp -a {{ $root.Values.openclaw.pluginStagePath }} /home/node/.openclaw/npm
+
+  umask 077
+{{- if or $irc.enabled $gw.post }}
+
+  # openclaw refuses a passwordFile that is a symlink, and every key in a
+  # Kubernetes Secret mount is one (they point into ../data). Copy the value
+  # onto a tmpfs as a regular file and point openclaw at that instead.
+  #
+  # A gateway that only *posts* needs this too: it runs no openclaw IRC
+  # channel, but `post-poem` dials ergo itself and ergo gates the network
+  # behind the shared PASS.
+  cp {{ $secretMount }}/irc-server-password {{ $credsMount }}/irc-server-password
+  chmod 0600 {{ $credsMount }}/irc-server-password
+{{- end }}
+{{- if $gw.secretRefs }}
+
+  # A2A peer tokens. openclaw compares `channels.a2a.peers.*.token` as a
+  # literal -- it is not a SecretRef and it resolves no ${ENV} template -- so
+  # the real value has to be in openclaw.json. Substituting it here rather
+  # than rendering it into the ConfigMap is what keeps `kubectl get configmap`
+  # from being a credential disclosure.
+  #
+  # The value reaches sed through argv, which is safe in this specific place
+  # and nowhere else: Kubernetes does not share a PID namespace between
+  # containers by default, and this init container has exited before the
+  # gateway -- and therefore before the agent's own shell -- ever starts.
+  subst() {
+    sed -i "s|__ASI_SECRET_$1__|$(cat "{{ $secretMount }}/$1")|g" \
+      /home/node/.openclaw/openclaw.json
+  }
+{{- range $ref := $gw.secretRefs }}
+  subst {{ $ref }}
+{{- end }}
+{{- end }}
+{{- if $gw.a2a.outbound }}
+
+  # Outbound bearers, one file per peer this gateway calls. These are read by
+  # the *agent*, not by openclaw: the calling convention is a curl to the
+  # peer's /a2a/v1, because the plugin's own outbound path hardcodes
+  # `returnImmediately: true` and throws the reply away. Keeping the token in
+  # a file means the agent can `cat` it into a header without it ever passing
+  # through the model's context.
+{{- range $peer, $key := $gw.a2a.outbound }}
+  cp {{ $secretMount }}/{{ $key }} {{ $credsMount }}/a2a-{{ $peer }}-outbound
+  chmod 0400 {{ $credsMount }}/a2a-{{ $peer }}-outbound
+{{- end }}
+{{- end }}
+
+  # Agent definitions, from charts/asi/agents/<gateway>/. These are prompt
+  # content: openclaw injects the workspace's AGENTS.md / SOUL.md /
+  # IDENTITY.md / USER.md / BOOTSTRAP.md into the system prompt, and offers no
+  # way to point at context files outside the workspace, so the only way to
+  # define an agent from the repo is to land the files here.
+  #
+  # Copied file by file rather than as a directory, deliberately. The chart
+  # owns these names and replaces them on every boot -- an edit to a persona
+  # in git takes effect on the next roll, and anything openclaw or the agent
+  # wrote over one does not survive. Everything *else* in the workspace is
+  # the agent's own work and is left completely alone, which is why this is
+  # not the `rm -rf` the plugin tree gets.
+  umask 022
+{{- range $agentId := $gw.agentIds }}
+{{- $workspace := get $gw.workspaces $agentId }}
+  mkdir -p {{ $workspace }}
+{{- range $path := index $gw.files $agentId }}
+  cp /agents/{{ $agentId }}/{{ base $path }} {{ $workspace }}/{{ base $path }}
+{{- end }}
+{{- end }}
+{{- if $gw.a2a.outbound }}
+{{- $pool := keys $gw.a2a.outbound | sortAlpha }}
+{{/*
+Equal weights are the common case and get the simpler form: the raw digest is
+the score and `[ a \> b ]` compares it, which is safe on equal-length
+lowercase hex. Unequal weights need the log method and therefore float math,
+so the whole comparison moves into awk -- and that is roughly where the
+ergonomics start arguing for a flag service instead.
+*/}}
+{{- $weights := list }}
+{{- range $peer := $pool }}
+{{- $weights = append $weights (toString (get (get $root.Values.resolvedGateways $peer) "weight")) }}
+{{- end }}
+{{- $uniform := eq (len ($weights | uniq)) 1 }}
+
+pick-poet-gateway: |
+  #!/bin/sh
+  # Chooses which poet variant a conversation talks to, and remembers the
+  # choice. Run by the *agent*, from {{ include "asi.binMountPath" $root }}.
+  #
+  #   eval "$(pick-poet-gateway "$CTX")"   # sets PEER, URL, TOKEN_FILE
+  #
+  # This is a script and not a paragraph in AGENTS.md on purpose. An LLM asked
+  # to send 10% of work to B does not produce a calibrated 10%, and cannot
+  # compute a hash in its head.
+  set -eu
+
+  CTX=${1:-}
+  [ -n "$CTX" ] || { echo "usage: pick-poet-gateway <contextId>" >&2; exit 2; }
+
+  # The log is the mapping. Rendezvous hashing below only ever assigns a
+  # context that has no record yet, so adding a variant cannot move an
+  # existing conversation and the caller never has to keep agreeing with a
+  # hash it computed in the past. Minimal-disruption properties are not
+  # load-bearing here; being able to stop recomputing is.
+  #
+  # It lives in *this* gateway's workspace, not the callee's: the caller has
+  # to read it before it knows which gateway to address, so a record held by
+  # the other end could not answer the question.
+  LOG={{ $gw.workspacePath }}/a2a-assignments.log
+
+  # Two concurrent first-calls on one context can both append. First match
+  # wins on read, so the mapping is still stable from then on -- and one
+  # contextId is meant to carry one task at a time anyway, because replies are
+  # matched FIFO per context rather than per task.
+  #
+  # awk rather than grep: the context id is compared as a whole field, so a
+  # value containing regex metacharacters matches itself and nothing else.
+  PEER=$(awk -v c="$CTX" '$1==c{print $2; exit}' "$LOG" 2>/dev/null || true)
+
+  if [ -z "$PEER" ]; then
+    # Rendezvous hashing: argmax_i H(ctx || node_i). Not consistent hashing --
+    # that earns its keep with many nodes and needs virtual nodes to balance
+    # at all, while this balances perfectly at two and extends to weights via
+    # the log method (score = -w / ln(u)).
+    best= bestscore=
+{{- range $peer := $pool }}
+{{- $weight := (get (get $root.Values.resolvedGateways $peer) "weight") }}
+    score=$(printf '%s|%s' "$CTX" '{{ $peer }}' | sha256sum | cut -c1-16)
+{{- if not $uniform }}
+    # u = digest / 2^64, in (0,1); score = -w / ln(u). awk carries this in a
+    # double, so the 64-bit digest is truncated to 53 bits of entropy -- ample
+    # for bucketing, and the reason the comparison below has to be numeric
+    # rather than lexicographic: these scores are not equal-width.
+    score=$(awk -v h="$score" -v w={{ $weight }} 'BEGIN{
+      u=0; n=split("0123456789abcdef",d,""); for(i=1;i<=length(h);i++){
+        c=substr(h,i,1); for(j=1;j<=n;j++) if(d[j]==c) break; u=u*16+(j-1) }
+      u=(u+0.5)/18446744073709551616; printf "%.17g", -w/log(u) }')
+{{- end }}
+{{- if $uniform }}
+    if [ -z "$bestscore" ] || [ "$score" \> "$bestscore" ]; then
+{{- else }}
+    if [ -z "$bestscore" ] \
+      || awk -v a="$score" -v b="$bestscore" 'BEGIN{exit !(a>b)}'; then
+{{- end }}
+      best={{ $peer }} bestscore=$score
+    fi
+{{- end }}
+    PEER=$best
+    mkdir -p "$(dirname "$LOG")"
+    printf '%s %s\n' "$CTX" "$PEER" >> "$LOG"
+  fi
+
+  echo "PEER=$PEER"
+  case "$PEER" in
+{{- range $peer := $pool }}
+    {{ $peer }})
+      echo 'URL={{ include "asi.gateway.url" (dict "root" $root "key" $peer) }}/a2a/v1'
+      echo 'TOKEN_FILE={{ include "asi.credsMountPath" $root }}/a2a-{{ $peer }}-outbound'
+      ;;
+{{- end }}
+    *) echo "unknown peer $PEER" >&2; exit 1 ;;
+  esac
+{{- end }}
+{{- if $gw.post }}
+
+post-poem: |
+  #!/bin/sh
+  # Posts what it reads on stdin to IRC, as this gateway's own nick. Run by the
+  # *agent*, from {{ include "asi.binMountPath" $root }}.
+  #
+  #   printf '%s' "$poem" | post-poem
+  #
+  # This exists because openclaw's own reply delivery does not survive the
+  # trip. Reaching a channel that is not the turn's source channel needs
+  # message(action="send"), and a model asked to deliver its answer that way
+  # frequently just... answers, leaving the text private and the run
+  # "successful" -- openclaw's own docs call this out and recommend avoiding
+  # the mode. A shell command is an ordinary action rather than a reply, which
+  # is a thing models do not forget to do.
+  #
+  # It also fixes the nick. openclaw opens a fresh IRC connection per send and
+  # collides with its own persistent one, so poems arrived from `poet-a_`.
+  # This gateway runs no openclaw IRC channel at all, so nothing holds the
+  # nick and this connection takes it cleanly.
+  set -eu
+  # Every argument is quoted, and the channel argument is why: an unquoted
+  # `#poetry` starts a shell comment, which silently swallows it and every
+  # argument after it.
+  exec node -e '
+  const net = require("net"), fs = require("fs");
+  const [nick, channel, passFile, host, port] = process.argv.slice(-5);
+  const pass = fs.readFileSync(passFile, "utf8").trim();
+  let text = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (d) => { text += d; }).on("end", () => {
+    // One PRIVMSG per line: IRC has no multi-line message, and a 512-byte
+    // frame including the envelope, so long lines are chunked rather than
+    // silently truncated by the server.
+    const lines = [];
+    for (const raw of text.replace(/\r/g, "").split("\n")) {
+      const line = raw.trim();
+      if (!line) continue;
+      for (let i = 0; i < line.length; i += 400) lines.push(line.slice(i, i + 400));
+    }
+    if (!lines.length) { console.error("post-poem: nothing on stdin"); process.exit(2); }
+    const s = net.connect(Number(port), host, () =>
+      s.write("PASS " + pass + "\r\nNICK " + nick + "\r\nUSER " + nick + " 0 * :" + nick + "\r\n"));
+    let buf = "", sent = false;
+    s.on("error", (e) => { console.error("post-poem: " + e.message); process.exit(4); });
+    s.on("data", (d) => {
+      buf += d;
+      const got = buf.split("\r\n"); buf = got.pop();
+      for (const l of got) {
+        if (l.startsWith("PING")) { s.write("PONG" + l.slice(4) + "\r\n"); continue; }
+        const p = l.split(" ");
+        if (p[1] === "433") { console.error("post-poem: nick " + nick + " in use"); process.exit(3); }
+        if (p[1] === "001") s.write("JOIN " + channel + "\r\n");
+        // Send only once the JOIN is confirmed -- the channel is +n, so a
+        // PRIVMSG that races the JOIN is dropped by the server with no error.
+        if (p[1] === "JOIN" && l.indexOf(nick + "!") === 1 && !sent) {
+          sent = true;
+          for (const line of lines) s.write("PRIVMSG " + channel + " :" + line + "\r\n");
+          s.write("QUIT :posted\r\n");
+          console.log("posted " + lines.length + " line(s) to " + channel + " as " + nick);
+          setTimeout(() => process.exit(0), 500);
+        }
+      }
+    });
+    setTimeout(() => { console.error("post-poem: timed out"); process.exit(5); }, 20000);
+  });
+  ' '{{ $gw.irc.nick }}' '{{ $gw.post.channel }}' '{{ $credsMount }}/irc-server-password' '{{ include "asi.ergo.fullname" $root }}' '{{ int $root.Values.ergo.plainPort }}'
+{{- end }}
+{{- if and $root.Values.openclaw.otel.enabled $root.Values.openclaw.otel.resource.workspace.enabled }}
+{{- $store := $root.Values.openclaw.otel.resource.workspace.store }}
+
+provenance.sh: |
+  #!/bin/sh
+  # Fingerprints the agent workspace and hands the result to the gateway as
+  # OTEL_RESOURCE_ATTRIBUTES, so every exported span says which *contents*
+  # the agent was running with. Runs as an init container, before openclaw.
+  set -eu
+
+  # Derived per gateway: this is the workspace of the one agent this gateway
+  # runs. A gateway running more than one falls back to the shared root, which
+  # fingerprints the parent of all of them -- see values.yaml.
+  WORKSPACE={{ $gw.workspacePath }}
+  STORE={{ $store }}/store.git
+  OUT={{ include "asi.provenanceMountPath" $root }}/attrs
+
+  emit() {
+    printf '%s' "$1" > "$OUT"
+    echo "provenance: $1"
+  }
+
+  # A fresh volume has no workspace: openclaw generates this content on its
+  # first bootstrap rather than shipping it in the image, so on the very
+  # first boot there is genuinely nothing to fingerprint yet. Say so rather
+  # than emitting a hash of nothing.
+  if [ ! -d "$WORKSPACE" ]; then
+    emit 'openclaw.workspace.tree=absent,openclaw.workspace.snapshot=absent,openclaw.workspace.git_head=absent,openclaw.workspace.git_dirty=false'
+    exit 0
+  fi
+
+  # The workspace repo's own state, read with its environment explicitly
+  # cleared so the snapshot store below cannot leak into it. --no-optional-locks
+  # keeps a read from refreshing its index: this must not mutate the agent's
+  # repo just by looking at it.
+  # `rev-parse --verify -q` rather than plain `rev-parse`: on a repo with no
+  # commits -- which is exactly what openclaw leaves behind -- plain
+  # rev-parse prints the literal "HEAD" on stdout *and* fails, so a
+  # `|| echo none` fallback appends to it and puts a newline in the middle
+  # of the attribute. --verify -q prints nothing and just exits nonzero.
+  HEAD=$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; \
+    git --no-optional-locks -C "$WORKSPACE" rev-parse --verify -q HEAD 2>/dev/null || true)
+  [ -n "$HEAD" ] || HEAD=none
+  DIRTY=false
+  if [ -n "$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; \
+      git --no-optional-locks -C "$WORKSPACE" status --porcelain 2>/dev/null || true)" ]; then
+    DIRTY=true
+  fi
+
+  # Snapshot into a store of our own. Pointing --git-dir elsewhere while
+  # --work-tree stays on the workspace records the content without touching
+  # the workspace's .git, and a private index file keeps `git add -A` from
+  # writing the agent's.
+  mkdir -p "$(dirname "$STORE")" "$(dirname "$OUT")"
+  [ -d "$STORE" ] || git init -q --bare "$STORE"
+
+  GIT_DIR="$STORE"
+  GIT_WORK_TREE="$WORKSPACE"
+  GIT_INDEX_FILE=/tmp/provenance.index
+  export GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+  rm -f "$GIT_INDEX_FILE"
+
+  # -A is the point: every file here is untracked in the agent's own repo,
+  # so anything less would hash an empty tree.
+  git add -A
+  TREE=$(git write-tree)
+
+  # One commit per *distinct* tree. A restart that changed nothing reuses the
+  # previous snapshot id, so an unchanged workspace keeps one stable
+  # identifier across the pod's whole life rather than a commit per boot.
+  PARENT=$(git rev-parse --verify -q refs/heads/provenance || true)
+  PREV_TREE=""
+  if [ -n "$PARENT" ]; then
+    PREV_TREE=$(git rev-parse "$PARENT^{tree}")
+  fi
+
+  if [ "$TREE" = "$PREV_TREE" ]; then
+    SNAPSHOT="$PARENT"
+  else
+    GIT_AUTHOR_NAME=asi-provenance
+    GIT_AUTHOR_EMAIL=provenance@asi.invalid
+    GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+    GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+    export GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+    MESSAGE="workspace at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [ -n "$PARENT" ]; then
+      SNAPSHOT=$(git commit-tree "$TREE" -p "$PARENT" -m "$MESSAGE")
+    else
+      SNAPSHOT=$(git commit-tree "$TREE" -m "$MESSAGE")
+    fi
+    # The ref is what keeps these objects reachable, and so unpruned.
+    git update-ref refs/heads/provenance "$SNAPSHOT"
+  fi
+
+  emit "openclaw.workspace.tree=$TREE,openclaw.workspace.snapshot=$SNAPSHOT,openclaw.workspace.git_head=$HEAD,openclaw.workspace.git_dirty=$DIRTY"
+{{- end }}
+{{- end -}}
+
+{{- include "asi.gateways" . -}}
+{{- range $key, $gw := .Values.resolvedGateways }}
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "asi.openclaw.fullname" . }}
+  name: {{ $gw.fullname }}
   labels:
-    {{- include "asi.labels" . | nindent 4 }}
+    {{- include "asi.labels" $ | nindent 4 }}
     app.kubernetes.io/component: openclaw
+    asi.dev/gateway: {{ $key }}
 data:
-  # `passwordFile` keeps the IRC PASS out of this ConfigMap and out of the
-  # pod's environment, where openclaw's own agent could read it back.
-  openclaw.json: |
-    {{- $config | toPrettyJson | nindent 4 }}
-
-  render.sh: |
-    #!/bin/sh
-    # Runs as an init container, in the openclaw image.
-    set -eu
-
-    # Both directories are subPaths of the same PVC, so they may not exist yet
-    # on a fresh volume.
-    mkdir -p /home/node/.openclaw /home/node/.config/openclaw
-
-    # The chart is the source of truth for openclaw.json: anything openclaw
-    # wrote to it in place (channels.irc.configWrites) is replaced on restart.
-    cp /config/openclaw.json /home/node/.openclaw/openclaw.json
-
-    # Same rule for the plugin tree, and for the same reason: @openclaw/irc is
-    # baked into the image, but openclaw only trusts a plugin loaded from its
-    # managed root -- which is here, on the volume. Replaced wholesale rather
-    # than merged, so a version bump actually takes effect and the project
-    # directory of a superseded version does not linger beside it. Anything
-    # installed by hand into a running pod does not survive the restart.
-    rm -rf /home/node/.openclaw/npm
-    cp -a {{ .Values.openclaw.pluginStagePath }} /home/node/.openclaw/npm
-
-    # openclaw refuses a passwordFile that is a symlink, and every key in a
-    # Kubernetes Secret mount is one (they point into ../data). Copy the value
-    # onto a tmpfs as a regular file and point openclaw at that instead.
-    umask 077
-    cp {{ $secretMount }}/irc-server-password {{ $credsMount }}/irc-server-password
-    chmod 0600 {{ $credsMount }}/irc-server-password
-{{- if $agents.ids }}
-
-    # Agent definitions, from charts/asi/agents/. These are prompt content:
-    # openclaw injects the workspace's AGENTS.md / SOUL.md / IDENTITY.md /
-    # USER.md / BOOTSTRAP.md into the system prompt, and offers no way to point
-    # at context files outside the workspace, so the only way to define an
-    # agent from the repo is to land the files here.
-    #
-    # Copied file by file rather than as a directory, deliberately. The chart
-    # owns these names and replaces them on every boot -- an edit to a persona
-    # in git takes effect on the next roll, and anything openclaw or the agent
-    # wrote over one does not survive. Everything *else* in the workspace is
-    # the agent's own work and is left completely alone, which is why this is
-    # not the `rm -rf` the plugin tree gets.
-    umask 022
-{{- range $id := $agents.ids }}
-{{- $workspace := get (get $agents.entries $id) "workspace" }}
-    mkdir -p {{ $workspace }}
-{{- range $path := index $agents.files $id }}
-    cp /agents/{{ $id }}/{{ base $path }} {{ $workspace }}/{{ base $path }}
-{{- end }}
-{{- end }}
-{{- end }}
-{{- if and .Values.openclaw.otel.enabled .Values.openclaw.otel.resource.workspace.enabled }}
-{{- $workspace := .Values.openclaw.otel.resource.workspace }}
-
-  provenance.sh: |
-    #!/bin/sh
-    # Fingerprints the agent workspace and hands the result to the gateway as
-    # OTEL_RESOURCE_ATTRIBUTES, so every exported span says which *contents*
-    # the agent was running with. Runs as an init container, before openclaw.
-    set -eu
-
-    WORKSPACE={{ $workspace.path }}
-    STORE={{ $workspace.store }}/store.git
-    OUT={{ include "asi.provenanceMountPath" . }}/attrs
-
-    emit() {
-      printf '%s' "$1" > "$OUT"
-      echo "provenance: $1"
-    }
-
-    # A fresh volume has no workspace: openclaw generates this content on its
-    # first bootstrap rather than shipping it in the image, so on the very
-    # first boot there is genuinely nothing to fingerprint yet. Say so rather
-    # than emitting a hash of nothing.
-    if [ ! -d "$WORKSPACE" ]; then
-      emit 'openclaw.workspace.tree=absent,openclaw.workspace.snapshot=absent,openclaw.workspace.git_head=absent,openclaw.workspace.git_dirty=false'
-      exit 0
-    fi
-
-    # The workspace repo's own state, read with its environment explicitly
-    # cleared so the snapshot store below cannot leak into it. --no-optional-locks
-    # keeps a read from refreshing its index: this must not mutate the agent's
-    # repo just by looking at it.
-    # `rev-parse --verify -q` rather than plain `rev-parse`: on a repo with no
-    # commits -- which is exactly what openclaw leaves behind -- plain
-    # rev-parse prints the literal "HEAD" on stdout *and* fails, so a
-    # `|| echo none` fallback appends to it and puts a newline in the middle
-    # of the attribute. --verify -q prints nothing and just exits nonzero.
-    HEAD=$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; \
-      git --no-optional-locks -C "$WORKSPACE" rev-parse --verify -q HEAD 2>/dev/null || true)
-    [ -n "$HEAD" ] || HEAD=none
-    DIRTY=false
-    if [ -n "$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; \
-        git --no-optional-locks -C "$WORKSPACE" status --porcelain 2>/dev/null || true)" ]; then
-      DIRTY=true
-    fi
-
-    # Snapshot into a store of our own. Pointing --git-dir elsewhere while
-    # --work-tree stays on the workspace records the content without touching
-    # the workspace's .git, and a private index file keeps `git add -A` from
-    # writing the agent's.
-    mkdir -p "$(dirname "$STORE")" "$(dirname "$OUT")"
-    [ -d "$STORE" ] || git init -q --bare "$STORE"
-
-    GIT_DIR="$STORE"
-    GIT_WORK_TREE="$WORKSPACE"
-    GIT_INDEX_FILE=/tmp/provenance.index
-    export GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
-    rm -f "$GIT_INDEX_FILE"
-
-    # -A is the point: every file here is untracked in the agent's own repo,
-    # so anything less would hash an empty tree.
-    git add -A
-    TREE=$(git write-tree)
-
-    # One commit per *distinct* tree. A restart that changed nothing reuses the
-    # previous snapshot id, so an unchanged workspace keeps one stable
-    # identifier across the pod's whole life rather than a commit per boot.
-    PARENT=$(git rev-parse --verify -q refs/heads/provenance || true)
-    PREV_TREE=""
-    if [ -n "$PARENT" ]; then
-      PREV_TREE=$(git rev-parse "$PARENT^{tree}")
-    fi
-
-    if [ "$TREE" = "$PREV_TREE" ]; then
-      SNAPSHOT="$PARENT"
-    else
-      GIT_AUTHOR_NAME=asi-provenance
-      GIT_AUTHOR_EMAIL=provenance@asi.invalid
-      GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
-      GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
-      export GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
-      MESSAGE="workspace at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      if [ -n "$PARENT" ]; then
-        SNAPSHOT=$(git commit-tree "$TREE" -p "$PARENT" -m "$MESSAGE")
-      else
-        SNAPSHOT=$(git commit-tree "$TREE" -m "$MESSAGE")
-      fi
-      # The ref is what keeps these objects reachable, and so unpruned.
-      git update-ref refs/heads/provenance "$SNAPSHOT"
-    fi
-
-    emit "openclaw.workspace.tree=$TREE,openclaw.workspace.snapshot=$SNAPSHOT,openclaw.workspace.git_head=$HEAD,openclaw.workspace.git_dirty=$DIRTY"
+  {{- include "asi.gateway.configmapData" (dict "root" $ "gw" $gw) | nindent 2 }}
 {{- end }}

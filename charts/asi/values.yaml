@@ -13,11 +13,109 @@ secrets:
   # them. `make secrets-rotate` bumps it and rolls both workloads.
   generation: 0
 
-  # Length of each generated credential.
+  # Length of each generated credential. The gateway token and the A2A tokens
+  # are minted once per gateway and once per edge-direction respectively, so
+  # these are lengths for a family of keys rather than for a single one --
+  # `make secrets-show` lists whatever the current fleet came to.
   lengths:
     ircServerPassword: 40
     ircOperPassword: 40
     openclawGatewayToken: 48
+    a2aToken: 48
+
+# The fleet. One entry per openclaw gateway, and a gateway is this entry plus a
+# directory of agent definitions at `agents/<gateway>/<agentId>/` -- names,
+# Services, PVCs, A2A peer maps, secret keys and telemetry identity all derive
+# from those two. Adding the next gateway costs one entry here and one
+# directory; there is nothing else to keep in step.
+#
+# Everything a gateway does *not* say here it takes from `openclaw:` below,
+# which is the shared half: image, plugin allowlist, provider, agent defaults,
+# telemetry, gateway port. A gateway entry is only for what differs.
+#
+# Recognised keys, all optional:
+#
+#   irc.enabled     join the IRC network at all. Merged over `openclaw.irc`,
+#                   so a gateway can also override the nick, the channels or
+#                   the policies if it needs to.
+#   irc.listen      whether the gateway *responds* to what it hears. False
+#                   joins the channels and drops every inbound message, which
+#                   is what a gateway that only ever posts wants.
+#   messages        merged over `openclaw.messages`, notably `visibleReplies`.
+#   post.channel    ship `post-poem` and the IRC PASS, so this gateway can
+#                   deliver to an IRC channel by running a script rather than
+#                   through openclaw's own reply path. See the poets below.
+#   a2a.calls       peers this gateway may address over A2A. Declaring an edge
+#                   once wires both ends: the callee derives its own inbound
+#                   peer entry, and both directions of the bearer are minted.
+#   a2a.enabled     force the channel on or off. Defaults to on exactly when
+#                   the gateway is on one end of an edge -- set it true with
+#                   no peers to stand the plugin up on its own first.
+#   weight          relative share for A/B selection; see `pick-poet-gateway`.
+#   resources       replaces `openclaw.resources` for this gateway.
+#   persistence     merged over `openclaw.persistence`.
+#   extraEnv        merged over `openclaw.extraEnv`.
+gateways:
+  # The IRC-facing gateway, and the one that calls the others. This is the
+  # gateway the old single-gateway chart deployed, under a new name: it renders
+  # as `<release>-main`, not `<release>-openclaw`.
+  main:
+    irc:
+      enabled: true
+      channels:
+        - "#asi"
+    a2a:
+      # Every peer named here is a poet variant, so this list doubles as the
+      # A/B pool the selection script chooses from. Split the two apart the
+      # day `main` calls something that is not a variant of the same agent.
+      calls:
+        - poet-a
+        - poet-b
+
+  # A placeholder second gateway: its agent takes a subject and writes a poem.
+  # The deliverable is the fleet -- the chart, the edge, per-gateway telemetry,
+  # caller-side variant selection -- and a placeholder keeps the agent from
+  # competing with that for debugging attention. See
+  # docs/design/gateway-fleet.md#why-a-poet.
+  #
+  # Calls are fire-and-forget: `main` sends the request with
+  # `returnImmediately` and never waits, so the poem cannot come back as the
+  # A2A reply. The poet delivers it itself, by running `post-poem` to put it
+  # in #poetry.
+  #
+  # A script rather than openclaw's own delivery, because openclaw's needs
+  # `message(action="send")` to reach a channel that is not the turn's source
+  # channel -- and a model asked to deliver its answer that way reliably just
+  # answers instead, stranding the text and completing the run "successfully".
+  # Three escalating prompts did not fix it; an ordinary shell command did,
+  # first try. See docs/design/gateway-fleet.md#what-the-first-deploy-changed.
+  poet-a:
+    irc:
+      # No openclaw IRC channel at all. The poet reaches #poetry through the
+      # `post-poem` script instead, which dials ergo itself -- so nothing here
+      # holds the nick, and `post-poem` gets `poet-a` cleanly rather than the
+      # `poet-a_` that openclaw's own sender collided into.
+      #
+      # It also means the poet is never *in* #poetry between posts, so the
+      # bot-loop hazard is structural rather than policed: there is no inbound
+      # IRC traffic for it to answer.
+      enabled: false
+      nick: poet-a
+    post:
+      channel: "#poetry"
+    weight: 1
+
+  # The B variant. Same agent id (`poet`), so agent cards and bindings match
+  # and the caller's choice is the only difference; it differs by prompt, in
+  # `agents/poet-b/poet/`. Vary the model instead -- or as well -- with
+  # `entry.model` in that directory's `agent.yaml`.
+  poet-b:
+    irc:
+      enabled: false
+      nick: poet-b
+    post:
+      channel: "#poetry"
+    weight: 1
 
 ergo:
   image:
@@ -91,12 +189,53 @@ openclaw:
   # origin is "bundled" (or it is a trusted official install), and that bus is
   # the exporter's only event source. An npm-installed copy loads, reports
   # enabled, and exports nothing at all.
+  #
+  # `a2a` is bundled on the same terms and needs the same two things -- a slot
+  # here and an enabled entry. It is what carries traffic between gateways, so
+  # dropping it from this list while any gateway declares a peer is refused at
+  # render time rather than discovered as silence.
+  #
+  # This list is shared by every gateway. `irc` stays on it even for gateways
+  # that never join a network: an unconfigured channel plugin simply starts no
+  # channel, which is cheaper than making the allowlist itself per-gateway.
   plugins:
     allow:
       - irc
       - openai
       - codex
       - diagnostics-otel
+      - a2a
+
+  # How a model-authored reply reaches the conversation that asked for it.
+  #
+  #   automatic     openclaw posts the agent's final assistant text to the
+  #                 source channel. What you almost always want.
+  #   message_tool  the final text is kept *private* unless the agent calls
+  #                 message(action="send") itself.
+  #
+  # Set explicitly, and set to `automatic`, because the default is neither
+  # stable nor uniform: with this unset openclaw falls back to the agent
+  # harness's own `deliveryDefaults.sourceVisibleReplies`, and only an
+  # internal WebChat surface is guaranteed `automatic`. On the A2A channel
+  # that fallback resolves to `message_tool`, which is how a working agent
+  # produces a perfect answer and delivers nothing:
+  #
+  #   [source-reply/private-final] agent produced a long private final reply
+  #   without calling the configured delivery tool (message_tool_only);
+  #   response kept private and not delivered to the source channel
+  #   [turn/execution] visible channel turn dispatched with no queued reply
+  #   payloads: channel=a2a ... cause=completed
+  #
+  # The run *completes*. Nothing errors. The caller's blocking SendMessage
+  # comes back with no artifact, and the only trace is those two lines in the
+  # callee's log. Leaving this to a harness default is the kind of silent
+  # nothing this chart refuses elsewhere, so it is pinned here.
+  #
+  # `message_tool` is the right choice only for an agent that has the message
+  # tool and is expected to decide when to speak. The poet has no tools at
+  # all, deliberately, so for it that mode can only ever mean silence.
+  messages:
+    visibleReplies: automatic
 
   provider:
     # Supplied, never generated: `make deploy` pipes this in from the
@@ -106,12 +245,18 @@ openclaw:
     # Environment variable openclaw should read the key from.
     envVar: OPENAI_API_KEY
 
-  # Agents are defined in `charts/asi/agents/<id>/`, one directory per agent,
-  # and rendered into openclaw's `agents.entries` plus the top-level `bindings`
-  # list. See charts/asi/agents/README.md for the layout.
+  # Agents are defined in `charts/asi/agents/<gateway>/<agentId>/`, one
+  # directory per agent under the gateway that runs it, and rendered into that
+  # gateway's `agents.entries` plus its top-level `bindings` list. See
+  # charts/asi/agents/README.md for the layout.
   #
-  # The directory name is the openclaw agent id, and a directory counts as an
-  # agent only if it holds an `agent.yaml`. Its `*.md` files are the agent's
+  # The inner directory name is the openclaw agent id, and a directory counts
+  # as an agent only if it holds an `agent.yaml`. Agent ids need only be unique
+  # within a gateway, which is what lets both poet variants keep the id `poet`
+  # -- their agent cards and bindings match, so the caller's choice of gateway
+  # is the only thing that differs.
+  #
+  # Its `*.md` files are the agent's
   # definition -- AGENTS.md, SOUL.md, IDENTITY.md, USER.md, BOOTSTRAP.md -- and
   # openclaw injects them into the system prompt, so they are the agent's
   # behaviour rather than documentation of it.
@@ -123,8 +268,13 @@ openclaw:
   # openclaw.json. Nothing else in the workspace is touched -- the agent's
   # actual working files are its own.
   agents:
-    # Where a sole agent's workspace lives, and the parent of each agent's
-    # subdirectory once there is more than one. Matches openclaw's own default.
+    # Parent of every agent's workspace. Each agent gets `<root>/<agentId>`,
+    # always -- there is no sole-agent special case, so no agent's path depends
+    # on how many others exist and adding one never moves another. openclaw's
+    # own default is this root; the subdirectory is written out explicitly in
+    # `agents.entries.*.workspace` because the init container has to seed the
+    # very same path, and the two agreeing by construction beats the two
+    # agreeing by convention.
     workspaceRoot: /home/node/.openclaw/workspace
 
     # Stops openclaw generating its own AGENTS.md / SOUL.md / IDENTITY.md /
@@ -142,7 +292,29 @@ openclaw:
     # `skills`, `sandbox`, `contextInjection`, and so on.
     defaults: {}
 
+  # Shared IRC settings. Whether a given gateway uses them at all is
+  # `gateways.<name>.irc.enabled`, which is merged over this block -- so a
+  # gateway can join with a different nick or a different channel list without
+  # restating the rest.
   irc:
+    # The default for a gateway that says nothing. Every gateway in this fleet
+    # sets it explicitly anyway: which ones are on IRC, and on which channels,
+    # is the sort of thing to read off the entry rather than off an absence.
+    enabled: false
+
+    # Whether this gateway *responds* to what it hears, as opposed to merely
+    # being in the channel. False renders an empty `groups` map, so under
+    # `groupPolicy: allowlist` no channel is admitted and every inbound
+    # message is dropped with `drop channel <name> (not allowlisted)` -- while
+    # `channels` below still joins, so the gateway is visibly present.
+    #
+    # Nothing uses it today. The poets deliver with `post.channel` instead and
+    # run no IRC channel at all, which makes their bot-loop hazard structural
+    # rather than policed -- they are never in #poetry to hear anything. Kept
+    # because "join but stay quiet" is a real shape, and because the failure
+    # it prevents is silent.
+    listen: true
+
     nick: openclaw
     username: openclaw
     realname: ASI
@@ -232,7 +404,14 @@ openclaw:
     # /v1/traces, /v1/metrics and /v1/logs itself.
     endpoint: ""
 
-    # `service.name` on every exported span.
+    # Prefix for `service.name` on every exported span. The gateway name is
+    # appended, so spans arrive as `openclaw-gateway-main`,
+    # `openclaw-gateway-poet-a` and so on.
+    #
+    # Deriving this per gateway is what makes the A/B comparison readable at
+    # all: without it every pod in the fleet claims the same service and the
+    # two poet variants are indistinguishable in the collector. It is also why
+    # variant assignment needs no flag-evaluation events on the spans.
     serviceName: openclaw-gateway
 
     traces: true
@@ -283,11 +462,15 @@ openclaw:
     # (`openclaw.agent` reaches only skill spans and a few metrics), so they
     # are attached as *resource* attributes below, which lands them on every
     # span the process exports. Resource attributes describe the process, not
-    # the run -- accurate here because this pod runs a single agent, and worth
+    # the run -- accurate here because each pod runs a single agent, and worth
     # remembering if that ever stops being true.
     resource:
-      # `openclaw.agent`. openclaw's own name for the default agent is `main`.
-      agent: main
+      # `openclaw.agent`. Empty means "derive it": a gateway running exactly
+      # one agent stamps that agent's id, which is every gateway in this fleet.
+      # A gateway running more than one leaves the attribute off rather than
+      # claiming one of them for spans the others also produced. Set it to
+      # force a value fleet-wide.
+      agent: ""
 
       # `service.version`. Defaults to `openclaw.image.tag`, which is the
       # upstream openclaw version and the one place it is written down.
@@ -337,11 +520,19 @@ openclaw:
       workspace:
         enabled: true
 
-        # What to fingerprint. The agent workspace, not the whole of
-        # ~/.openclaw: the state sqlite next door changes on every turn and is
-        # large, so hashing it would make the fingerprint churn without
-        # describing the agent any better.
-        path: /home/node/.openclaw/workspace
+        # What gets fingerprinted is derived, not configured: the agent
+        # workspace of the gateway this pod is, `<workspaceRoot>/<agentId>`.
+        # Not the whole of ~/.openclaw -- the state sqlite next door changes on
+        # every turn and is large, so hashing it would make the fingerprint
+        # churn without describing the agent any better.
+        #
+        # This used to be a hardcoded path, and it was the one single-agent
+        # assumption `$multi` never guarded: a second agent would have left the
+        # fingerprint covering the *parent* of every workspace instead of the
+        # agent's own, silently and with no render error. A gateway running
+        # more than one agent still falls back to the root and inherits exactly
+        # that imprecision -- there is one set of resource attributes per
+        # process, and no honest way to make it describe two workspaces.
 
         # A bare git repo on the PVC holding every distinct snapshot, as a
         # `provenance` branch with one commit per observed change. It is the
@@ -351,14 +542,23 @@ openclaw:
         # and leaves its index alone.
         store: /var/lib/asi/provenance
 
+  # One Service per gateway, all of this type.
   service:
     type: ClusterIP
 
+  # Defaults for every gateway's volume; override per gateway with
+  # `gateways.<name>.persistence`. Each gateway has its own PVC, which is what
+  # makes multi-gateway isolation free here: openclaw's warnings about
+  # profiles, state directories and derived ports are about several gateways
+  # sharing one host, and separate pods with separate volumes satisfy all of it
+  # by construction.
   persistence:
     # Holds openclaw.json, the state sqlite db, and the agent workspace.
     size: 2Gi
     storageClass: ""
 
+  # Defaults for every gateway; override per gateway with
+  # `gateways.<name>.resources` and `gateways.<name>.extraEnv`.
   resources: {}
 
   extraEnv: {}
@@ -392,8 +592,20 @@ otelCollector:
   # `detailed` prints full spans with every attribute, which is the point of
   # running this at all -- it is how you see `openclaw.exec.exit_code` or
   # `openclaw.tool.owner` land. Drop to `normal` for one line per batch if the
-  # logs get too loud.
+  # logs get too loud. Applies to traces and logs.
   verbosity: detailed
+
+  # Metrics get their own, deliberately terse. They arrive every
+  # `openclaw.otel.flushIntervalMs` whether or not anything happened, and at
+  # `detailed` a single batch runs to roughly 3000 lines -- enough that ten
+  # seconds of an idle cluster evicts every span from the container log. That
+  # is not hypothetical: it is what made traces look broken when they were
+  # being received and printed correctly the whole time.
+  #
+  # `basic` keeps one summary line per batch, which is all you need to confirm
+  # metrics are flowing; raise it only while actually reading metric values,
+  # and expect spans to become unreadable while you do.
+  metricsVerbosity: basic
 
   service:
     type: ClusterIP

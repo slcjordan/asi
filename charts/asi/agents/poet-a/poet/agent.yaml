@@ -1,0 +1,26 @@
+# The A variant of the poet placeholder.
+#
+# `poet-a` and `poet-b` run the same agent id -- `poet` -- deliberately. The
+# agent card and the bindings match on both sides, so the caller's choice of
+# gateway is the only thing that differs between the variants, and the A/B
+# comparison is a comparison of one thing.
+
+# Empty: this variant is the baseline. What makes it the A variant is its
+# persona, in SOUL.md and AGENTS.md beside this file.
+#
+# To vary the *model* rather than the prompt, set it here and leave poet-b's
+# unset (or set it to something else):
+#
+#   entry:
+#     model: openai/gpt-5.4
+entry: {}
+
+# A2A is the only surface this gateway serves -- it never joins IRC, because
+# two openclaw instances in one channel answer each other forever. `accountId:
+# "*"` accepts any peer that got past the bearer check, which is the whole
+# auth story for A2A: the routes register with `auth: "plugin"`, so the peer
+# token is the gate and this binding is only about which agent handles it.
+bindings:
+  - match:
+      channel: a2a
+      accountId: "*"
