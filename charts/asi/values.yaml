@@ -205,6 +205,13 @@ openclaw:
       - codex
       - diagnostics-otel
       - a2a
+      # Local, and the only plugin here that this repo wrote: it contributes
+      # `TRACEPARENT` to the exec tool's environment so a command the agent
+      # runs can name the trace it belongs to. Staged into the image by
+      # images/openclaw/Dockerfile and loaded by path -- see
+      # `otel.propagation` below for why that is safe for this one and not for
+      # the IRC channel.
+      - asi-trace-env
 
   # How a model-authored reply reaches the conversation that asked for it.
   #
@@ -437,6 +444,45 @@ openclaw:
     # else exports content: spans otherwise carry only bounded identifiers,
     # and exec reports `command_length` rather than the command.
     captureContent: false
+
+    # Carrying trace context across the gateway boundary, so a dispatch and
+    # the run it causes share a trace id instead of being two unrelated traces
+    # in Jaeger. Off by default in upstream openclaw, in the sense that
+    # upstream does neither half of it.
+    #
+    # Two halves, and both are needed -- either alone changes nothing:
+    #
+    #   1. `asi-trace-env`, the plugin this enables, answers the
+    #      `resolve_exec_env` hook with the active run's `TRACEPARENT`. That is
+    #      what lets the `curl` in main's AGENTS.md send the header at all.
+    #      Without it the exec tool hands a command three OPENCLAW_* variables
+    #      and nothing else.
+    #   2. The A2A route has to *read* that header, which it does not:
+    #      openclaw parses `traceparent` for the gateway control protocol and
+    #      the whole a2a extension never mentions it. That half is a patch,
+    #      applied at image build by images/openclaw/patch-a2a-traceparent.mjs.
+    #
+    # `pick-poet-gateway` also keys the contextId off this, so turning it off
+    # is not only a telemetry change: the script falls back to minting a
+    # context per dispatch. See the resolution order in the script itself.
+    propagation:
+      enabled: true
+
+      # The plugin's id and where the image stages it. Loaded through
+      # `plugins.load.paths`, which this chart otherwise refuses -- a
+      # config-origin plugin is untrusted, and an untrusted plugin is denied
+      # the channel ingress queue, which is why IRC has to go through the
+      # managed npm root instead.
+      #
+      # That objection is about channels. This plugin registers no channel and
+      # takes no ingress; it answers one hook. `resolve_exec_env` is not in the
+      # set that needs `hooks.allowConversationAccess` (that list is
+      # before_model_resolve, agent_turn_prepare, before_prompt_build,
+      # before_agent_reply, llm_input, llm_output, before_agent_finalize,
+      # agent_end, before_agent_run), so loaded and allowed is the whole of
+      # what it needs.
+      pluginId: asi-trace-env
+      pluginPath: /opt/asi/plugins/asi-trace-env
 
     # openclaw does not put a run id on exported spans, so **the trace id is
     # the run correlation key** -- group by it rather than filtering on an

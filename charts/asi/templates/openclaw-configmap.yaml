@@ -46,15 +46,41 @@ unless it calls message(action="send"). A toolless agent then completes its
 run, logs `[source-reply/private-final]`, and delivers nothing, while the
 caller's blocking SendMessage returns an empty artifact. See values.yaml.
 */}}
+{{/*
+Trace propagation. The plugin is loaded by path, which is the one exception to
+the "deliberately no plugins.load.paths" rule below: that rule exists because a
+config-origin plugin is untrusted and an untrusted plugin is refused the
+channel ingress queue. This one registers no channel and answers one hook, so
+the queue never enters into it.
+
+Same silent-nothing refusal as the exporter and the A2A channel. Without the
+allowlist slot the plugin would not load, TRACEPARENT would simply be absent
+from every exec, and the only symptom would be that traces stop joining up --
+which looks exactly like the exporter being misconfigured.
+*/}}
+{{- $propagation := $root.Values.openclaw.otel.propagation -}}
+{{- $pluginsConfig := dict
+      "allow" $root.Values.openclaw.plugins.allow
+      "entries" $entries -}}
+{{- if and $root.Values.openclaw.otel.enabled $propagation.enabled -}}
+{{- if not (has $propagation.pluginId $root.Values.openclaw.plugins.allow) -}}
+{{- fail (printf "openclaw.otel.propagation.enabled is true but openclaw.plugins.allow does not name %q -- plugins.allow is an exclusive allowlist, so the hook would never register, TRACEPARENT would be absent from every exec, and the poet's run would keep opening a trace of its own" $propagation.pluginId) -}}
+{{- end -}}
+{{- $_ := set $pluginsConfig "load" (dict "paths" (list $propagation.pluginPath)) -}}
+{{- else -}}
+{{/*
+Turned off, so drop the derived entry as well. An enabled entry for a plugin
+with no load path names something that is not on disk anywhere.
+*/}}
+{{- $_ := unset $entries $propagation.pluginId -}}
+{{- end -}}
 {{- $config := dict
       "gateway" (dict
         "mode" "local"
         "bind" $root.Values.openclaw.gateway.bind)
       "messages" (dict
         "visibleReplies" $gw.messages.visibleReplies)
-      "plugins" (dict
-        "allow" $root.Values.openclaw.plugins.allow
-        "entries" $entries)
+      "plugins" $pluginsConfig
       "channels" dict -}}
 {{- $channels := get $config "channels" -}}
 {{- $irc := $gw.irc -}}
@@ -92,10 +118,14 @@ say so. That allowlist is exclusive and covers everything, not just channels:
 the model provider and the agent harness are plugins as well, which is why
 openclaw.plugins.allow names them too.
 
-Deliberately no `plugins.load.paths`. Pointing openclaw at a plugin directory
-loads it with origin "config", and an untrusted plugin is refused the channel
-ingress queue -- the IRC channel would start and immediately exit, forever.
-Seeding the managed root is what makes it trusted.
+IRC specifically must not come through `plugins.load.paths`. Pointing openclaw
+at a plugin directory loads it with origin "config", and an untrusted plugin is
+refused the channel ingress queue -- the IRC channel would start and
+immediately exit, forever. Seeding the managed root is what makes it trusted.
+
+`asi-trace-env` does load by path, and that is not a reversal of this: the
+refusal above is about the ingress queue, which only a channel asks for. See
+the propagation block above.
 */}}
 {{/*
 The hop to ergo is always plaintext, and has no switch because it could not
@@ -328,18 +358,93 @@ ergonomics start arguing for a flag service instead.
 
 pick-poet-gateway: |
   #!/bin/sh
-  # Chooses which poet variant a conversation talks to, and remembers the
-  # choice. Run by the *agent*, from {{ include "asi.binMountPath" $root }}.
+  # Resolves the contextId for a dispatch, chooses which poet variant it talks
+  # to, and remembers both. Run by the *agent*, from
+  # {{ include "asi.binMountPath" $root }}.
   #
-  #   eval "$(pick-poet-gateway "$CTX")"   # sets PEER, URL, TOKEN_FILE
+  #   eval "$(pick-poet-gateway -k "irc:#asi:$nick")"
+  #        # sets CTX, PEER, URL, TOKEN_FILE, TRACEPARENT
   #
   # This is a script and not a paragraph in AGENTS.md on purpose. An LLM asked
   # to send 10% of work to B does not produce a calibrated 10%, and cannot
-  # compute a hash in its head.
+  # compute a hash in its head -- and, the reason the context resolution below
+  # moved in here too, does not reliably reproduce a string it invented in an
+  # earlier turn either. A stickiness key the model has to re-author each time
+  # is a stickiness key that silently stops matching.
   set -eu
 
-  CTX=${1:-}
-  [ -n "$CTX" ] || { echo "usage: pick-poet-gateway <contextId>" >&2; exit 2; }
+  CTX= KEY=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -c) CTX=${2:-}; [ -n "$CTX" ] || { echo "-c needs a context id" >&2; exit 2; }; shift 2 ;;
+      -k) KEY=${2:-}; [ -n "$KEY" ] || { echo "-k needs a conversation key" >&2; exit 2; }; shift 2 ;;
+      --) shift; break ;;
+      -*) echo "usage: pick-poet-gateway [-c <contextId>] [-k <conversation key>]" >&2; exit 2 ;;
+      # A bare argument is a contextId. `make poem` calls it that way and so
+      # did every caller before -c existed.
+      *)  CTX=$1; shift ;;
+    esac
+  done
+
+  # Where a conversation key is remembered. Separate from the assignment log
+  # below because the two answer different questions and have different
+  # lifetimes: this one maps a conversation to its context, that one maps a
+  # context to its poet. Merging them would mean a context minted here could
+  # not be looked up by a caller that already has one.
+  CTXLOG={{ $gw.workspacePath }}/a2a-contexts.log
+
+  # 32 and 16 hex characters respectively -- a W3C trace id and span id. Each
+  # uuid contributes 32 hex characters, so two always cover the longer of the
+  # two. Reading the kernel rather than shelling out to openssl, which this
+  # image does not have.
+  newhex() {
+    cat /proc/sys/kernel/random/uuid /proc/sys/kernel/random/uuid \
+      | tr -d '\n-' | cut -c1-"$1"
+  }
+
+  # Context resolution, in four tiers. The first one that answers wins.
+  #
+  #   -c    an explicit context id, used verbatim. For callers that already
+  #         have a real key of their own.
+  #   -k    a conversation key, mapped to a minted context that is then stable
+  #         for the life of that conversation. This is the tier that keeps a
+  #         follow-up on the same poet, and the key is machine-derived rather
+  #         than model-authored.
+  #   env   $TRACEPARENT, contributed to every exec by the `asi-trace-env`
+  #         plugin. Its trace id *is* the run's trace id, so a dispatch with no
+  #         conversation behind it still gets a meaningful, already-exported
+  #         identifier instead of an invented one.
+  #   mint  a fresh trace id. Single-shot, and deliberately not recorded: a key
+  #         nothing else can reproduce has nothing to look up later.
+  #
+  # Tiers three and four are per-dispatch, so they carry no stickiness at all.
+  # That is the accepted cost of not making the model invent a key: a
+  # conversation that wants continuity passes -k.
+  TIER=mint
+  if [ -n "$CTX" ]; then
+    TIER=explicit
+  elif [ -n "$KEY" ]; then
+    TIER=key
+    # awk, not grep: the key is compared as a whole field, so a value holding
+    # regex metacharacters -- a nick can -- matches itself and nothing else.
+    CTX=$(awk -v k="$KEY" '$1==k{print $2; exit}' "$CTXLOG" 2>/dev/null || true)
+    if [ -z "$CTX" ]; then
+      CTX=$(newhex 32)
+      mkdir -p "$(dirname "$CTXLOG")"
+      printf '%s %s\n' "$KEY" "$CTX" >> "$CTXLOG"
+    fi
+  elif [ -n "${TRACEPARENT:-}" ]; then
+    # 00-<32 hex trace id>-<16 hex span id>-<2 hex flags>. Take the trace id,
+    # and only if the field is actually shaped like one -- a malformed header
+    # falls through to a mint rather than becoming a context id nothing else
+    # will ever agree with.
+    CANDIDATE=$(printf '%s' "$TRACEPARENT" | cut -d- -f2)
+    case "$CANDIDATE" in
+      *[!0-9a-f]* | "") ;;
+      ????????????????????????????????) CTX=$CANDIDATE; TIER=trace ;;
+    esac
+  fi
+  [ -n "$CTX" ] || CTX=$(newhex 32)
 
   # The log is the mapping. Rendezvous hashing below only ever assigns a
   # context that has no record yet, so adding a variant cannot move an
@@ -390,10 +495,37 @@ pick-poet-gateway: |
     fi
 {{- end }}
     PEER=$best
-    mkdir -p "$(dirname "$LOG")"
-    printf '%s %s\n' "$CTX" "$PEER" >> "$LOG"
+    # Not recorded for a minted context. Nothing can look that key up again --
+    # the next dispatch mints a different one -- so the line would be pure
+    # growth in a file every later call scans from the top.
+    if [ "$TIER" != mint ]; then
+      mkdir -p "$(dirname "$LOG")"
+      printf '%s %s\n' "$CTX" "$PEER" >> "$LOG"
+    fi
   fi
 
+  # The trace to put on the wire. An inherited $TRACEPARENT is passed through
+  # untouched so the callee's run attaches to the span that dispatched it --
+  # that span is real and exported, which is the whole point of the plugin
+  # handing over `parentSpanId` rather than a child it never emits.
+  #
+  # Without one, mint a traceparent so the header is still well-formed and the
+  # callee's spans at least share a trace with each other. It is rooted at a
+  # span that does not exist, which is the honest representation of a dispatch
+  # made outside any run -- `make poem` from a shell is exactly that.
+  if [ -n "${TRACEPARENT:-}" ]; then
+    OUT_TRACEPARENT=$TRACEPARENT
+  else
+    case "$CTX" in
+      ????????????????????????????????)
+        case "$CTX" in *[!0-9a-f]*) TRACEID=$(newhex 32) ;; *) TRACEID=$CTX ;; esac ;;
+      *) TRACEID=$(newhex 32) ;;
+    esac
+    OUT_TRACEPARENT="00-$TRACEID-$(newhex 16)-01"
+  fi
+
+  echo "CTX=$CTX"
+  echo "TRACEPARENT=$OUT_TRACEPARENT"
   echo "PEER=$PEER"
   case "$PEER" in
 {{- range $peer := $pool }}

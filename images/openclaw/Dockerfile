@@ -50,6 +50,38 @@ FROM ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION}
 # path relative to the HOME it was installed under.
 COPY --from=build --chown=node:node /tmp/build-home/.openclaw/npm /opt/openclaw/npm
 
+# Trace context across the gateway boundary, in two halves that are only
+# useful together. See docs/design/gateway-fleet.md#tracing-a-dispatch.
+#
+# Half one: make the A2A route adopt a caller's `traceparent`. openclaw does
+# this for the gateway control protocol already and does not do it for A2A, so
+# without the patch a dispatch and the run it causes are two unrelated traces.
+# The script finds its target by content and exits non-zero if the route has
+# moved, which fails the build rather than shipping an image that traces
+# nothing. Re-read it whenever OPENCLAW_VERSION moves.
+# --chown because the build runs as `node` and /tmp is sticky: a root-owned
+# copy here patches fine and then cannot be cleaned up.
+COPY --chown=node:node patch-a2a-traceparent.mjs /tmp/patch-a2a-traceparent.mjs
+RUN node /tmp/patch-a2a-traceparent.mjs /app/dist \
+ && rm /tmp/patch-a2a-traceparent.mjs
+
+# Half two: put the active run's traceparent into the exec tool's environment,
+# so the `curl` that dispatches a poem can send the header at all. This is a
+# `resolve_exec_env` hook -- a documented extension point -- rather than a
+# second patch, so it survives upgrades on its own.
+#
+# `node_modules/openclaw` is the same absolute-symlink trick the IRC plugin
+# relies on: the plugin imports `openclaw/plugin-sdk/...`, and without a peer
+# to resolve that against it fails to load with ERR_MODULE_NOT_FOUND. Measured,
+# not assumed. It lives here rather than in a ConfigMap for exactly that
+# reason -- a ConfigMap cannot carry the symlink.
+#
+# The chart still has to name it in `openclaw.plugins.allow`, add the path to
+# `plugins.load.paths` and enable its entry; being on disk does nothing.
+COPY --chown=node:node plugins/asi-trace-env /opt/asi/plugins/asi-trace-env
+RUN mkdir -p /opt/asi/plugins/asi-trace-env/node_modules \
+ && ln -s /app /opt/asi/plugins/asi-trace-env/node_modules/openclaw
+
 # Where the chart's init container copies from, and where under the volume it
 # has to land. Nothing reads these labels; they are here so `docker inspect`
 # answers the question without a shell.

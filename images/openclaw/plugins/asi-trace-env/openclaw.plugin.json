@@ -1,0 +1,12 @@
+{
+  "id": "asi-trace-env",
+  "name": "ASI trace env",
+  "description": "Exports the active run's W3C traceparent to the exec tool.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false
+  }
+}

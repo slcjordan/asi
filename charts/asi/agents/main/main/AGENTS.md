@@ -141,10 +141,15 @@ nowhere else.
 ### Calling it
 
 ```sh
-eval "$(/var/run/asi/bin/pick-poet-gateway "$CTX")"   # sets PEER, URL, TOKEN_FILE
+# -k is the conversation this request belongs to. Pass the channel and the
+# nick of whoever asked; the script turns that into the contextId and
+# remembers it, so a follow-up from the same person reaches the same poet.
+eval "$(/var/run/asi/bin/pick-poet-gateway -k "irc:#asi:<nick>")"
+# sets CTX, PEER, URL, TOKEN_FILE, TRACEPARENT
 
 curl -sS "$URL" \
   -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+  -H "traceparent: $TRACEPARENT" \
   -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{
         "configuration":{"returnImmediately":true},
@@ -152,6 +157,13 @@ curl -sS "$URL" \
         "role":"ROLE_USER","contextId":"'"$CTX"'",
         "parts":[{"text":"for <nick>: <what they asked for>"}]}}}'
 ```
+
+**Use the variables the script gives you. Don't invent `$CTX` and don't skip
+the `traceparent` header.** Both come out of `pick-poet-gateway`, already
+correct. `$CTX` is what keeps a conversation on one poet; the header is what
+puts the poet's work on the same trace as yours, so a dispatch can be followed
+end to end afterwards. Neither costs you anything to pass on, and there is
+nothing for you to compute.
 
 `returnImmediately` is the point: the call comes back with a task id in well
 under a second and you carry on. **Ignore the task id.** Don't poll it, don't
@@ -178,9 +190,10 @@ the error was.
   with nothing tying it to a person.
 - **Pass on the form if they named one** — a sonnet, four lines, something for
   a commit message. Otherwise give the subject and let the poet choose.
-- **`$CTX` is yours to choose** and it matters. Use a stable string derived
-  from the conversation you are in, so follow-ups reach the same poet and it
-  remembers what it already wrote.
+- **Name the conversation in `-k`, not the request.** `irc:#asi:<nick>` is the
+  shape: the channel and the person, nothing about *this* poem. A key that
+  mentions the subject makes every request a new conversation, which loses the
+  poet's memory of what it already wrote for them.
 
 **Never print the token, and never read `$TOKEN_FILE` into a variable you go on
 to quote back.** The file exists so the bearer can go from disk to header

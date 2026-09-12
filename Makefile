@@ -332,8 +332,9 @@ async function begin() {
     configuration: { returnImmediately: true },
     message: { messageId: crypto.randomUUID(), role: "ROLE_USER", contextId: ctx,
       parts: [{ text: "for " + who + ": " + subject }] } } };
+  const trace = process.env.TRACEPARENT ? { traceparent: process.env.TRACEPARENT } : {};
   const r = await fetch(url, { method: "POST", body: JSON.stringify(body),
-    headers: { "content-type": "application/json", authorization: "Bearer " + process.env.TOKEN } });
+    headers: { "content-type": "application/json", authorization: "Bearer " + process.env.TOKEN, ...trace } });
   const j = await r.json().catch(() => null);
   if (!j || j.error) { console.error("dispatch failed: " + JSON.stringify(j)); process.exit(1); }
   const id = j.result && j.result.task && j.result.task.id;
@@ -345,14 +346,35 @@ setTimeout(() => {
   process.exit(1);
 }, Number(watch) * 1000);
 endef
+# Exported so a recipe can reach the script as a shell variable. Expanding a
+# multi-line `define` into recipe text does not work: make treats the newlines
+# it produces as recipe-line separators, so the shell is handed a fragment
+# ending mid-quote. Through the environment the whole script stays one argv
+# word, which is also how POEM_SCRIPT below reaches `sh -c`.
+export POEM_WATCHER_JS
 
 define POEM_SCRIPT
 set -eu
 CTX=$$1; SUBJECT=$$2; WHO=$$3; WATCH=$$4
-eval "$$(/var/run/asi/bin/pick-poet-gateway "$$CTX")"
+# An empty POEM_CTX is a way to ask for a one-shot: with nothing to go on the
+# script mints a context, and a minted one is deliberately not recorded, so it
+# leaves no assignment behind. The default is a fixed string precisely because
+# the opposite is usually wanted here -- `make poem` run twice should reach the
+# same poet and find its own history.
+#
+# Nothing sets TRACEPARENT on this path: it comes from the exec tool, and this
+# runs under `kubectl exec`, not under a turn. The script mints one so the
+# header is still well-formed and the poet's own spans share a trace.
+if [ -n "$$CTX" ]; then
+  eval "$$(/var/run/asi/bin/pick-poet-gateway -c "$$CTX")"
+else
+  eval "$$(/var/run/asi/bin/pick-poet-gateway)"
+fi
 echo "context: $$CTX" >&2
 echo "peer:    $$PEER" >&2
-TOKEN=$$(cat "$$TOKEN_FILE") exec node -e '$(POEM_WATCHER_JS)' "$$URL" "$$CTX" "$$SUBJECT" "$$WHO" "$$WATCH"
+echo "trace:   $$TRACEPARENT" >&2
+TOKEN=$$(cat "$$TOKEN_FILE") TRACEPARENT=$$TRACEPARENT \
+  exec node -e '$(POEM_WATCHER_JS)' "$$URL" "$$CTX" "$$SUBJECT" "$$WHO" "$$WATCH"
 endef
 export POEM_SCRIPT
 
@@ -366,7 +388,7 @@ poem: ## dispatch a poem request and watch #poetry for it -- POEM_SUBJECT=... PO
 .PHONY: poetry
 poetry: ## tail #poetry -- POEM_WATCH=<seconds>
 	@$(KUBECTL) exec statefulset/$(RELEASE)-main -c openclaw -- \
-		node -e '$(POEM_WATCHER_JS)' "" "" "" "" "$(POEM_WATCH)"
+		node -e "$$POEM_WATCHER_JS" "" "" "" "" "$(POEM_WATCH)"
 
 # ---------------------------------------------------------------------------
 # Jaeger

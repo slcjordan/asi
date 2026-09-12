@@ -1,0 +1,10 @@
+{
+  "name": "asi-trace-env",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Exports the active run's W3C traceparent to the exec tool.",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}
